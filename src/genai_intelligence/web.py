@@ -519,6 +519,10 @@ def status_api() -> dict:
         internal_requests = [dict(row) for row in repo.recent_internal_requests(100)]
         external_requests = [dict(row) for row in repo.recent_external_requests(100)
                              if row["operation"] != "metadata_health_check"]
+        source_requests = [dict(row) for row in repo.conn.execute("""SELECT r.started_at AS created_at,
+          s.name AS source,r.status,r.fetched_count AS fetched,r.inserted_count AS inserted,
+          r.latency_ms,r.error FROM ingestion_runs r JOIN sources s ON s.id=r.source_id
+          ORDER BY r.started_at DESC LIMIT 100""").fetchall()]
         return {
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "database": {"status": "connected", "backend": repo.backend},
@@ -533,6 +537,7 @@ def status_api() -> dict:
             "last_embedding_attempt": dict(last_embedding) if last_embedding else None,
             "internal_requests": internal_requests,
             "external_requests": external_requests,
+            "source_requests": source_requests,
             "counts": counts,
             "documents_by_status": {row["status"]: int(row["total"]) for row in documents},
             "current_edition": dict(edition) if edition else None,
@@ -642,6 +647,14 @@ def status_page() -> str:
         f'<td><span class="pill {"good" if item["outcome"] == "success" else "bad"}">{esc(item["outcome"])} · {esc(item["http_status"] or "no response")}</span>'
         f'<small>{esc(item["error_type"] or "")}</small></td><td>{esc(item["latency_ms"])} ms</td><td>{stamp(item["created_at"])}</td></tr>'
         for item in snapshot["external_requests"])
+    def source_request_row(item: dict) -> str:
+        error = f'<small class="error">{esc(item["error"])}</small>' if item.get("error") else ""
+        css = "good" if item["status"] == "success" else "bad"
+        latency = item["latency_ms"] if item["latency_ms"] is not None else "—"
+        return (f'<tr><td>{esc(item["source"])}</td><td><span class="pill {css}">{esc(item["status"])}</span>'
+                f'<small>{esc(item["fetched"])} fetched · {esc(item["inserted"])} new</small></td>'
+                f'<td>{esc(latency)} ms</td><td>{stamp(item["created_at"])}{error}</td></tr>')
+    source_request_rows = "".join(source_request_row(item) for item in snapshot["source_requests"])
     sources_html = "".join(source_rows) or '<tr><td colspan="4">No sources are registered yet.</td></tr>'
     provider_rows = []
     for provider in snapshot["providers"]:
@@ -694,6 +707,7 @@ def status_page() -> str:
 <section class="panel"><h2>Library progress</h2><div class="metrics"><span class="metric"><strong>{count["sources"]}</strong> enabled sources</span><span class="metric"><strong>{count["articles"]:,}</strong> collected articles</span><span class="metric"><strong>{count["indexed_ready"]:,}</strong> indexed docs</span><span class="metric"><strong>{count["indexed_full_text"]:,}</strong> full text</span><span class="metric"><strong>{count["indexed_failed"]:,}</strong> indexing failures</span><span class="metric"><strong>{count["analyses"]:,}</strong> deep reads</span><span class="metric"><strong>{count["published_editions"]:,}</strong> saved editions</span></div></section>
 <h2>Scheduled pipeline</h2><div class="grid">{"".join(phase_cards)}</div>
 <section class="panel"><h2>External feeds and APIs</h2><p>These show the outcome of the latest scheduled collection; opening a row visits that source.</p><div class="scroll"><table><thead><tr><th>Source endpoint</th><th>Last result</th><th>Last checked</th><th>Collection</th></tr></thead><tbody>{sources_html}</tbody></table></div></section>
+<section class="panel"><h2>Recent source request history</h2><p>Individual feed/API collection attempts with result, item counts, latency, and any error. Showing the latest {len(snapshot["source_requests"])} attempts.</p><div class="scroll"><table><thead><tr><th>Source</th><th>Result</th><th>Time</th><th>When / error</th></tr></thead><tbody>{source_request_rows or '<tr><td colspan="4">No source requests logged yet.</td></tr>'}</tbody></table></div></section>
 <section class="panel"><h2>LLM and embedding endpoint health</h2><p>Checks call provider model-metadata endpoints every 15 minutes at most. They verify the key and configured model can be reached; they do not generate text or embeddings or consume model tokens.</p><div class="scroll"><table><thead><tr><th>Provider/model</th><th>Reachability</th><th>Last checked</th><th>Response</th></tr></thead><tbody>{providers_html}</tbody></table></div><h3>Last successful real work</h3><p>Embedding: {esc(embedding_status)}{esc(embedding_error)}</p><p>Long-form analysis: {esc(analysis_status)}</p><p>Study kit: {esc(study_status)}</p></section>
 <section class="panel"><h2>Actual model and embedding requests</h2><p>These are real generation and embedding calls, with result and response time. Prompts, credentials, and response bodies are not stored.</p><div class="scroll"><table><thead><tr><th>Provider / operation</th><th>Result</th><th>Time</th><th>When</th></tr></thead><tbody>{external_rows or '<tr><td colspan="4">No real model or embedding request has been made yet.</td></tr>'}</tbody></table></div></section>
 <section class="panel"><h2>App and backend request log</h2><p>Last {len(snapshot["internal_requests"])} requests (up to 30 days retained). Route, HTTP result, latency, and error type are logged; query strings, IP addresses, and request contents are excluded.</p><div class="scroll"><table><thead><tr><th>Request</th><th>Result</th><th>Time</th><th>When</th></tr></thead><tbody>{''.join(f'<tr><td><code>{esc(item["method"])} {esc(item["path"])}</code></td><td><span class="pill {"good" if item["status_code"] < 400 else "bad"}">{item["status_code"]}</span><small>{esc(item["error_type"] or "")}</small></td><td>{item["latency_ms"]} ms</td><td>{stamp(item["created_at"])}</td></tr>' for item in snapshot["internal_requests"]) or '<tr><td colspan="4">No requests logged yet.</td></tr>'}</tbody></table></div></section>

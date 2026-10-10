@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "genai-intelligence"
-version = "0.1.0"
+version = "0.2.0"
 description = "A free, local-first GenAI technology intelligence newspaper pipeline"
 readme = "README.md"
 requires-python = ">=3.10"

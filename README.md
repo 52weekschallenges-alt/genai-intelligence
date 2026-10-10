@@ -1,6 +1,6 @@
-# GenAI Intelligence V0.1
+# GenAI Intelligence V0.2
 
-A zero-cost, source-linked GenAI technology newspaper. It collects public RSS/Atom feeds and public GitHub, Hugging Face Hub, and arXiv API results into SQLite, and includes a searchable web reader. It does not call an LLM or any paid service.
+A zero-cost, source-linked GenAI technology newspaper. It collects public RSS/Atom feeds and public GitHub, Hugging Face Hub, and arXiv API results, then selects a compact daily briefing with explainable rules. It does not call an LLM or any paid service.
 
 ## What is included
 
@@ -8,6 +8,9 @@ A zero-cost, source-linked GenAI technology newspaper. It collects public RSS/At
 - A shared article model with source, identity, title, canonical URL, summary/content, author, timestamps, categories, trust score, and source metadata.
 - SQLite tables for sources, articles, and ingestion runs, with indexes and idempotent upserts.
 - RSS/Atom, GitHub Search API, Hugging Face Models API, and arXiv Atom API collectors.
+- A daily briefing of up to 20 items from the last seven days, ranked by freshness, source trust, headline signals, and available community engagement.
+- Duplicate-title and URL suppression plus a three-story-per-source cap to make the briefing more varied. Each selected story shows the rules that helped it qualify.
+- A full archive remains available from the **All articles** view; items are not deleted by curation.
 - A CLI for listing sources, ingesting, browsing recent articles, and checking database counts, plus a searchable web reader and JSON API.
 - A Dockerfile and Docker Compose configuration for hosting with persistent storage and daily scheduled collection.
 - Tests for source loading, URL normalization, idempotency, and collection failures.
@@ -28,7 +31,7 @@ genai-intel stats
 uvicorn genai_intelligence.web:app --reload
 ```
 
-The reader is available at `http://127.0.0.1:8000`; the JSON API is at `/api/articles`, and `/health` is the health check. The web service starts collection on startup and repeats every 24 hours. Set `ENABLE_INGESTION=false` to serve only already-collected data, or change `INGEST_INTERVAL_HOURS`. The command defaults to `config/sources.yaml` and `data/genai_intelligence.sqlite3`. Override these with `--config`, `--db`, `GENAI_INTEL_CONFIG`, or `GENAI_INTEL_DB`. A `GITHUB_TOKEN` or `HF_TOKEN` environment variable is optional and only raises public API rate limits. No `.env` loader is required; export values in your shell or use your preferred dotenv tool.
+The reader is available at `http://127.0.0.1:8000`; its default page is the daily briefing, while **All articles** opens the full archive. The JSON API defaults to the briefing at `/api/articles`; use `/api/articles?edition=all` for the archive. `/health` is the health check. The web service starts collection on startup and repeats every 24 hours. Set `ENABLE_INGESTION=false` to serve only already-collected data, or change `INGEST_INTERVAL_HOURS`. The command defaults to `config/sources.yaml` and `data/genai_intelligence.sqlite3`. Override these with `--config`, `--db`, `GENAI_INTEL_CONFIG`, or `GENAI_INTEL_DB`. A `GITHUB_TOKEN` or `HF_TOKEN` environment variable is optional and only raises public API rate limits. No `.env` loader is required; export values in your shell or use your preferred dotenv tool.
 
 ## Run as a hosted web service
 
@@ -40,7 +43,7 @@ docker compose up --build
 
 Open `http://localhost:8000`. Check `http://localhost:8000/health` and `http://localhost:8000/api/articles`. Stop the service with `Ctrl+C`; the named `newspaper-data` volume keeps collected data across container rebuilds.
 
-To publish externally, deploy this Dockerfile to a container host that supports persistent disks or volumes. Mount persistent storage at `/data`, expose the configured `PORT` (default `8000`), and set `GENAI_INTEL_DB=/data/genai_intelligence.sqlite3`. Keep `GENAI_INTEL_CONFIG=/app/config/sources.yaml`, `ENABLE_INGESTION=true`, and `INGEST_ON_STARTUP=true`. The service serves a public, read-only API and reader page; it has no accounts or private user data in V0.1. Use one service instance with SQLite; multiple replicas need a shared database such as PostgreSQL and a separate scheduler design.
+To publish externally, deploy this Dockerfile to a container host that supports persistent disks or volumes. Mount persistent storage at `/data`, expose the configured `PORT` (default `8000`), and set `GENAI_INTEL_DB=/data/genai_intelligence.sqlite3`. Keep `GENAI_INTEL_CONFIG=/app/config/sources.yaml`, `ENABLE_INGESTION=true`, and `INGEST_ON_STARTUP=true`. The service serves a public, read-only API and reader page; it has no accounts or private user data. Use one service instance with SQLite; multiple replicas need a shared database such as PostgreSQL and a separate scheduler design.
 
 ### Deploy on Vercel (free personal project)
 
@@ -61,6 +64,6 @@ Each `sources` entry has required `id`, `name`, `type`, and `url` fields. `type`
 
 Collection errors are isolated per source, recorded in `ingestion_runs`, reported in the CLI output, and cause `ingest` to return a nonzero status if any source failed. Re-running a collection updates records by source identity and avoids duplicating them. URL canonicalization removes fragments and common tracking parameters. Similar stories arriving from different sources remain distinct records so their provenance is retained.
 
-## V0.1 boundaries
+## Curation rules and boundaries
 
-The database stores raw source metadata and normalized article records. Ranking, personalization, clustering across publishers, and summarization are later steps. `trust_score` and categories are source defaults, not claims that an article has been editorially reviewed.
+The database keeps the complete normalized archive. The daily briefing considers items from the last seven days, favors freshness and higher configured source trust, boosts selected high-signal headline terms, uses engagement metadata when available, removes exact and near-duplicate headlines, and caps each source at three stories. The rules and reasons are deterministic and do not generate summaries. `trust_score` and categories are source defaults, not claims that an article has been editorially reviewed. Personalization and generated summaries are not included.

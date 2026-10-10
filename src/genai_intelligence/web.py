@@ -8,6 +8,7 @@ import logging
 import os
 import hmac
 import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlencode, urlsplit
@@ -122,6 +123,41 @@ def _run_weekly_edition() -> dict:
         repo.close()
 
 
+def _track_pipeline_phase(phase: str, operation) -> dict:
+    run_id = str(uuid.uuid4())
+    started = datetime.now(timezone.utc).isoformat()
+    repo = Repository(_database_path())
+    try:
+        repo.start_pipeline_run(run_id, phase, started)
+    finally:
+        repo.close()
+    try:
+        result = operation()
+        if phase == "collect":
+            status = "success" if not any(row.get("status") == "error" for row in result) else "partial"
+        elif result.get("status") in {"complete", "already_published", "published"} and not result.get("failed", 0):
+            status = "success"
+        elif result.get("status") in {"waiting_for_embedding_key", "waiting_for_index", "waiting_for_provider", "in_progress"}:
+            status = "waiting"
+        else:
+            status = "partial"
+        repo = Repository(_database_path())
+        try:
+            repo.finish_pipeline_run(run_id, datetime.now(timezone.utc).isoformat(), status,
+                                     {"result": result})
+        finally:
+            repo.close()
+        return result
+    except Exception as exc:
+        repo = Repository(_database_path())
+        try:
+            repo.finish_pipeline_run(run_id, datetime.now(timezone.utc).isoformat(), "error",
+                                     error=f"{type(exc).__name__}: {str(exc)[:300]}")
+        finally:
+            repo.close()
+        raise
+
+
 async def _scheduled_ingestion() -> None:
     if os.getenv("INGEST_ON_STARTUP", "true").lower() not in {"0", "false", "no"}:
         try:
@@ -165,7 +201,7 @@ async def scheduled_collection(request: Request):
     if not secret or not hmac.compare_digest(supplied, f"Bearer {secret}"):
         from fastapi.responses import JSONResponse
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    results = await asyncio.to_thread(_run_ingestion)
+    results = await asyncio.to_thread(_track_pipeline_phase, "collect", _run_ingestion)
     failures = sum(1 for row in results if row["status"] == "error")
     return {"ok": failures == 0, "sources": len(results), "failures": failures, "results": results}
 
@@ -176,7 +212,7 @@ async def scheduled_index(request: Request):
     supplied = request.headers.get("authorization", "")
     if not secret or not hmac.compare_digest(supplied, f"Bearer {secret}"):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return await asyncio.to_thread(_run_document_index)
+    return await asyncio.to_thread(_track_pipeline_phase, "index", _run_document_index)
 
 
 @app.get("/api/cron/edition")
@@ -185,7 +221,7 @@ async def scheduled_edition(request: Request):
     supplied = request.headers.get("authorization", "")
     if not secret or not hmac.compare_digest(supplied, f"Bearer {secret}"):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return await asyncio.to_thread(_run_weekly_edition)
+    return await asyncio.to_thread(_track_pipeline_phase, "edition", _run_weekly_edition)
 
 
 @app.get("/api/study/{article_id}")
@@ -308,6 +344,148 @@ def _articles(q: str, source: str, category: str, limit: int, offset: int,
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/status")
+def status_api() -> dict:
+    """Read-only operations snapshot; never returns configured secret values."""
+    repo = Repository(_database_path())
+    try:
+        counts = {
+            "articles": int(repo.conn.execute("SELECT COUNT(*) AS total FROM articles").fetchone()["total"]),
+            "sources": int(repo.conn.execute("SELECT COUNT(*) AS total FROM sources WHERE enabled=1").fetchone()["total"]),
+            "indexed_ready": int(repo.conn.execute("SELECT COUNT(*) AS total FROM article_documents WHERE status='ready'").fetchone()["total"]),
+            "indexed_full_text": int(repo.conn.execute("SELECT COUNT(*) AS total FROM article_documents WHERE status='ready' AND content_scope='full_text'").fetchone()["total"]),
+            "indexed_failed": int(repo.conn.execute("SELECT COUNT(*) AS total FROM article_documents WHERE status='failed'").fetchone()["total"]),
+            "analyses": int(repo.conn.execute("SELECT COUNT(*) AS total FROM article_analyses").fetchone()["total"]),
+            "published_editions": int(repo.conn.execute("SELECT COUNT(*) AS total FROM weekly_editions WHERE status='published'").fetchone()["total"]),
+        }
+        source_rows = repo.conn.execute("""SELECT s.id,s.name,s.type,s.url,r.started_at AS checked_at,
+          r.status AS last_status,r.fetched_count,r.inserted_count,r.error
+          FROM sources s LEFT JOIN ingestion_runs r ON r.id=(
+            SELECT MAX(id) FROM ingestion_runs WHERE source_id=s.id
+          ) WHERE s.enabled=1 ORDER BY s.name""").fetchall()
+        pipeline_rows = repo.conn.execute("""SELECT p.* FROM pipeline_runs p JOIN (
+          SELECT phase,MAX(started_at) AS latest FROM pipeline_runs GROUP BY phase
+        ) latest ON latest.phase=p.phase AND latest.latest=p.started_at ORDER BY p.phase""").fetchall()
+        current_week = datetime.now(timezone.utc).strftime("%G-W%V")
+        edition = repo.get_weekly_edition(current_week)
+        documents = repo.conn.execute("SELECT status,COUNT(*) AS total FROM article_documents GROUP BY status").fetchall()
+        return {
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "database": {"status": "connected", "backend": repo.backend},
+            "configuration": {
+                "cron_secret_configured": bool(os.getenv("CRON_SECRET", "").strip()),
+                "embedding_key_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+                "study_and_analysis_provider_configured": bool(os.getenv("GROQ_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip()),
+            },
+            "counts": counts,
+            "documents_by_status": {row["status"]: int(row["total"]) for row in documents},
+            "current_edition": dict(edition) if edition else None,
+            "pipeline": [{
+                "phase": row["phase"], "started_at": row["started_at"], "finished_at": row["finished_at"],
+                "status": row["status"], "error": row["error"], "detail": json.loads(row["detail_json"] or "{}"),
+            } for row in pipeline_rows],
+            "sources": [{
+                "id": row["id"], "name": row["name"], "type": row["type"], "url": row["url"],
+                "checked_at": row["checked_at"], "last_status": row["last_status"],
+                "fetched": row["fetched_count"], "inserted": row["inserted_count"], "error": row["error"],
+            } for row in source_rows],
+            "internal_endpoints": [
+                {"path": "/", "purpose": "Reader"}, {"path": "/health", "purpose": "App health"},
+                {"path": "/api/status", "purpose": "This dashboard and database status"},
+                {"path": "/api/articles", "purpose": "Article API"}, {"path": "/api/sources", "purpose": "Source registry API"},
+                {"path": "/api/cron/collect", "purpose": "Scheduled collector · protected"},
+                {"path": "/api/cron/index", "purpose": "Scheduled indexer · protected"},
+                {"path": "/api/cron/edition", "purpose": "Scheduled edition writer · protected"},
+            ],
+        }
+    finally:
+        repo.close()
+
+
+@app.get("/status", response_class=HTMLResponse)
+def status_page() -> str:
+    try:
+        snapshot = status_api()
+    except Exception as exc:
+        logger.exception("Operations dashboard could not read status")
+        return HTMLResponse("<h1>Status dashboard unavailable</h1><p>The app could not read its database. Check the deployment logs.</p>", status_code=503)
+
+    def esc(value: object) -> str:
+        return html.escape(str(value if value is not None else "—"), quote=True)
+
+    def stamp(value: object) -> str:
+        if not value:
+            return "Never"
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%b %d, %H:%M UTC")
+        except (ValueError, AttributeError):
+            return esc(value)
+
+    def is_fresh(value: object, hours: int = 36) -> bool:
+        if not value:
+            return False
+        try:
+            checked = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if checked.tzinfo is None:
+                checked = checked.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - checked.astimezone(timezone.utc)).total_seconds() < hours * 3600
+        except (ValueError, AttributeError):
+            return False
+
+    phases = {row["phase"]: row for row in snapshot["pipeline"]}
+    phase_names = {"collect": "Collect sources", "index": "Index full documents", "edition": "Write weekly reads"}
+    phase_cards = []
+    for phase in ("collect", "index", "edition"):
+        run = phases.get(phase)
+        status = run["status"] if run else "not run yet"
+        stale = bool(run and status != "running" and not is_fresh(run["started_at"]))
+        stuck = bool(run and status == "running" and not is_fresh(run["started_at"], hours=1))
+        if stale:
+            status = f"stale · {status}"
+        if stuck:
+            status = "possibly stuck"
+        css = "good" if status in {"success", "already_published", "complete"} else "warn" if status in {"waiting", "partial", "running"} else "bad" if status in {"error", "possibly stuck"} else "muted"
+        if stale:
+            css = "warn"
+        detail = run.get("detail", {}).get("result", {}) if run else {}
+        if isinstance(detail, list):
+            failed_sources = sum(1 for item in detail if item.get("status") == "error")
+            summary = f"{len(detail)} sources checked · {failed_sources} failed"
+        elif isinstance(detail, dict):
+            summary = ", ".join(f"{esc(k.replace('_', ' '))}: {esc(v)}" for k, v in detail.items() if not isinstance(v, (dict, list)))
+        else:
+            summary = ""
+        error = f'<p class="error">{esc(run["error"])}</p>' if run and run.get("error") else ""
+        phase_cards.append(f'<section class="card"><div class="row"><h2>{phase_names[phase]}</h2><span class="pill {css}">{esc(status)}</span></div><p>Last run: {stamp(run["started_at"]) if run else "Never"}</p><p>{summary or "Waiting for its first scheduled run."}</p>{error}</section>')
+
+    source_rows = []
+    for source in snapshot["sources"]:
+        state = source["last_status"] or "not checked"
+        stale = bool(source["checked_at"] and not is_fresh(source["checked_at"]))
+        if stale:
+            state = f"stale · {state}"
+        css = "warn" if stale else "good" if state == "success" else "bad" if state == "error" else "muted"
+        checked = stamp(source["checked_at"])
+        counts = f'{source["fetched"]} fetched · {source["inserted"]} new' if source["fetched"] is not None else "—"
+        error = f'<br><span class="error">{esc(source["error"])}</span>' if source.get("error") else ""
+        source_rows.append(f'<tr><td><a href="{esc(source["url"])}" target="_blank" rel="noopener noreferrer">{esc(source["name"])}</a><small>{esc(source["type"])} · {esc(source["url"])}</small></td><td><span class="pill {css}">{esc(state)}</span>{error}</td><td>{checked}</td><td>{counts}</td></tr>')
+
+    endpoint_rows = "".join(f'<tr><td><code>{esc(endpoint["path"])}</code></td><td>{esc(endpoint["purpose"])}</td><td><span class="pill good">registered</span></td></tr>' for endpoint in snapshot["internal_endpoints"])
+    sources_html = "".join(source_rows) or '<tr><td colspan="4">No sources are registered yet.</td></tr>'
+    count = snapshot["counts"]
+    current = snapshot["current_edition"]
+    edition_status = current["status"] if current else "not started"
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60"><title>System status · GenAI Intelligence</title><style>
+*{{box-sizing:border-box}}body{{margin:0;background:#f4f6f8;color:#172536;font:15px/1.5 system-ui,sans-serif}}main{{max-width:1100px;margin:30px auto;padding:0 18px}}header,.card,.panel{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px;margin:14px 0}}header h1{{margin:0}}header p,small,.muted{{color:#64748b}}.top{{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}}a{{color:#2859c5}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:12px}}.card{{margin:0}}.card h2{{margin:0;font-size:1.05rem}}.card p{{margin:10px 0 0;color:#64748b}}.row{{display:flex;justify-content:space-between;gap:8px;align-items:center}}.pill{{display:inline-block;border-radius:99px;padding:3px 9px;font-size:.8rem;font-weight:650;text-transform:capitalize;background:#eef2f7;color:#475569}}.good{{background:#e7f7ef;color:#167448}}.warn{{background:#fff4d8;color:#885b00}}.bad,.error{{color:#b42318}}.bad{{background:#fdebea}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px 8px;text-align:left;border-top:1px solid #e2e8f0;vertical-align:top}}th{{font-size:.8rem;color:#64748b}}td small{{display:block;overflow-wrap:anywhere}}.scroll{{overflow:auto}}.metrics{{display:flex;gap:10px;flex-wrap:wrap}}.metric{{padding:10px 13px;background:#f7f9fc;border-radius:8px}}.metric strong{{font-size:1.2rem}}code{{font-size:.9em}}@media(max-width:650px){{main{{margin-top:14px}}th:nth-child(3),td:nth-child(3){{display:none}}}}
+</style></head><body><main><header><div class="top"><div><h1>System status</h1><p>Pipeline progress and last known source checks. Refreshes every 60 seconds.</p></div><a href="/">← Back to newspaper</a></div><p>Updated {stamp(snapshot["checked_at"])} · Database: <span class="pill good">{esc(snapshot["database"]["status"])} ({esc(snapshot["database"]["backend"])})</span> · Current edition: <span class="pill">{esc(edition_status)}</span></p></header>
+<section class="panel"><h2>Library progress</h2><div class="metrics"><span class="metric"><strong>{count["sources"]}</strong> enabled sources</span><span class="metric"><strong>{count["articles"]:,}</strong> collected articles</span><span class="metric"><strong>{count["indexed_ready"]:,}</strong> indexed docs</span><span class="metric"><strong>{count["indexed_full_text"]:,}</strong> full text</span><span class="metric"><strong>{count["indexed_failed"]:,}</strong> indexing failures</span><span class="metric"><strong>{count["analyses"]:,}</strong> deep reads</span><span class="metric"><strong>{count["published_editions"]:,}</strong> saved editions</span></div></section>
+<h2>Scheduled pipeline</h2><div class="grid">{"".join(phase_cards)}</div>
+<section class="panel"><h2>External feeds and APIs</h2><p>These show the outcome of the latest scheduled collection; opening a row visits that source.</p><div class="scroll"><table><thead><tr><th>Source endpoint</th><th>Last result</th><th>Last checked</th><th>Collection</th></tr></thead><tbody>{sources_html}</tbody></table></div></section>
+<section class="panel"><h2>App endpoints</h2><div class="scroll"><table><thead><tr><th>Route</th><th>Purpose</th><th>Status</th></tr></thead><tbody>{endpoint_rows}</tbody></table></div><p>Protected cron routes are called by Vercel on schedule. Their run outcomes appear above; secret values are never shown.</p></section>
+<section class="panel"><h2>Configuration checks</h2><p>Database connection: <span class="pill good">Connected</span></p><p>Scheduled-job secret: <span class="pill {"good" if snapshot["configuration"]["cron_secret_configured"] else "bad"}">{"configured" if snapshot["configuration"]["cron_secret_configured"] else "missing"}</span></p><p>Embedding key: <span class="pill {"good" if snapshot["configuration"]["embedding_key_configured"] else "bad"}">{"configured" if snapshot["configuration"]["embedding_key_configured"] else "missing"}</span></p><p>Analysis/study provider: <span class="pill {"good" if snapshot["configuration"]["study_and_analysis_provider_configured"] else "bad"}">{"configured" if snapshot["configuration"]["study_and_analysis_provider_configured"] else "missing"}</span></p></section>
+<p class="muted">This dashboard reports recorded checks and configuration presence; it does not make extra paid monitoring or model calls.</p></main></body></html>'''
 
 
 @app.get("/notebook.js")
@@ -457,9 +635,9 @@ def home(request: Request, q: str = "", source: str = "", category: str = "",
 .editions{{display:flex;gap:18px;margin:0 0 12px;padding:0 4px}}.editions a{{color:var(--accent);text-decoration:none;font-weight:600}}.editions a.active{{color:var(--ink);border-bottom:2px solid var(--accent)}}.why{{margin:15px 0 0;padding:13px 15px;border-left:3px solid #a8bce9;background:#f7f9fd;border-radius:0 8px 8px 0;color:#33445a;font-size:.93rem}}.why p{{margin:4px 0 0;color:#475569}}.analysis-section{{max-width:780px;margin:22px auto}}.analysis-section h3{{font-family:Georgia,serif;font-size:1.2rem;margin:0 0 8px}}.analysis-section p{{font-size:1.04rem;line-height:1.75;color:#334155!important;margin:0 0 12px!important}}.topics{{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}}.topics a{{background:#fff;border:1px solid var(--line);border-radius:999px;padding:7px 12px;text-decoration:none;color:#34569c;font-size:.88rem}}.topics a.active{{background:#2859c5;color:white;border-color:#2859c5}}.complete{{margin-top:14px}}.study{{margin-top:14px}}.study h3{{margin-bottom:4px}}.study details{{border-top:1px solid var(--line);padding:8px 0}}.study summary{{cursor:pointer;font-weight:600}}.study .answer{{color:#176b43;font-weight:600}}.study .error{{color:#a22}}.study fieldset{{border:1px solid var(--line);border-radius:8px;margin:10px 0;padding:12px}}.study fieldset label{{display:inline-block;padding:4px}}.card{{border-radius:14px;padding:22px 24px;margin:16px auto;max-width:820px;box-shadow:0 5px 18px #16263b0a}}.meta{{text-transform:none;letter-spacing:0}}.card h2{{font:600 clamp(1.35rem,3vw,1.7rem)/1.25 Georgia,serif;letter-spacing:-.015em;margin:13px 0 8px}}.brief-label{{font-size:.75rem!important;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)!important;margin:12px 0 3px!important}}.card p.brief{{font-size:1.08rem;line-height:1.58;color:#26384d;margin:0 0 14px}}.evidence{{margin-top:13px;color:var(--muted);font-size:.82rem}}.evidence a{{color:#34569c;text-decoration:none}}.actions{{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:16px}}.original{{display:inline-flex;align-items:center;gap:6px;background:var(--accent);color:white;text-decoration:none;border-radius:7px;padding:9px 13px;font-weight:650}}.original:hover{{background:#1d459f}}.actions button.complete{{margin:0;background:white;color:#23416b;border-color:#cbd5e1;font-weight:600}}.actions button.complete:hover{{background:#f4f7fb}}.study{{border-top:1px solid var(--line);padding-top:12px}}@media(max-width:600px){{.card{{padding:18px}}.actions{{align-items:stretch}}.actions>*{{text-align:center;justify-content:center;flex:1 1 100%}}}}
 </style></head><body><header><h1>GenAI Intelligence</h1><p>A maintained, searchable index of AI documents, with substantial source-grounded analysis and a personal learning notebook.</p></header>
 <main><div class="stats"><span class="stat"><strong>{total:,}</strong> {"stories from the last 7 days" if edition == "briefing" else "matching articles"}</span><span class="stat"><strong>{counts["pool_total"]:,}</strong> in library</span><span class="stat"><strong>{counts["indexed_total"]:,}</strong> documents indexed</span><span class="stat"><strong>{counts["sources"]}</strong> sources</span></div>
-<nav class="editions"><a class="{"active" if edition == "briefing" else ""}" href="{briefing_url}">This week</a><a class="{"active" if edition == "all" else ""}" href="{archive_url}">All articles ({counts["pool_total"]:,})</a><a href="/issues">Saved editions</a></nav>
+<nav class="editions"><a class="{"active" if edition == "briefing" else ""}" href="{briefing_url}">This week</a><a class="{"active" if edition == "all" else ""}" href="{archive_url}">All articles ({counts["pool_total"]:,})</a><a href="/issues">Saved editions</a><a href="/status">System status</a></nav>
 <nav class="topics" aria-label="Browse by topic"><a class="{"active" if not category else ""}" href="{all_topics_url}">All topics</a>{"".join(topic_links)}</nav>
 <form action="/" method="get"><input type="hidden" name="edition" value="{edition}"><input type="search" name="q" value="{html.escape(q, quote=True)}" placeholder="Search headlines and indexed analyses" aria-label="Search articles"><select name="source" aria-label="Filter by source">{source_options}</select><select name="category" aria-label="Filter by topic">{category_options}</select><button type="submit">Filter</button></form>
-{"".join(cards) if cards else '<div class="empty">No complete deep reads are ready yet. The scheduled pipeline collects source updates, indexes full documents, and then writes the long-form analyses shown here. Only completed analyses appear in this edition. <a href="/issues">View saved editions</a>.</div>'}
+{"".join(cards) if cards else '<div class="empty">No complete deep reads are ready yet. The scheduled pipeline collects source updates, indexes full documents, and then writes the long-form analyses shown here. Only completed analyses appear in this edition. <a href="/status">Check pipeline progress and source health</a> · <a href="/issues">View saved editions</a>.</div>'}
 <nav class="pagination">{pagination}</nav></main><footer>Every analysis is generated from indexed source documents; original sources are linked for verification. Completed study kits are saved in your notebook.</footer>
 <script src="/notebook.js" defer></script></body></html>'''

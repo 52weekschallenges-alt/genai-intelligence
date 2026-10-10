@@ -48,6 +48,11 @@ CREATE TABLE IF NOT EXISTS reading_progress (
 CREATE TABLE IF NOT EXISTS study_generation_limits (
   day TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+  id TEXT PRIMARY KEY, phase TEXT NOT NULL, started_at TEXT NOT NULL,
+  finished_at TEXT, status TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '{}', error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_phase_started ON pipeline_runs(phase, started_at DESC);
 CREATE TABLE IF NOT EXISTS weekly_editions (
   week_id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, article_ids_json TEXT NOT NULL,
   story_count INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'published'
@@ -107,6 +112,11 @@ CREATE TABLE IF NOT EXISTS reading_progress (
 CREATE TABLE IF NOT EXISTS study_generation_limits (
   day TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+  id TEXT PRIMARY KEY, phase TEXT NOT NULL, started_at TEXT NOT NULL,
+  finished_at TEXT, status TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '{}', error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_phase_started ON pipeline_runs(phase, started_at DESC);
 CREATE TABLE IF NOT EXISTS weekly_editions (
   week_id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, article_ids_json TEXT NOT NULL,
   story_count INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'published'
@@ -290,6 +300,21 @@ class Repository:
         )
         self.conn.commit()
         return result.rowcount == 1
+
+    def start_pipeline_run(self, run_id: str, phase: str, started_at: str) -> None:
+        self.conn.execute(
+            "INSERT INTO pipeline_runs(id,phase,started_at,status) VALUES(?,?,?,'running')",
+            (run_id, phase, started_at),
+        )
+        self.conn.commit()
+
+    def finish_pipeline_run(self, run_id: str, finished_at: str, status: str,
+                            detail: dict | None = None, error: str | None = None) -> None:
+        self.conn.execute(
+            "UPDATE pipeline_runs SET finished_at=?,status=?,detail_json=?,error=? WHERE id=?",
+            (finished_at, status, json.dumps(detail or {}, ensure_ascii=False, default=str), error, run_id),
+        )
+        self.conn.commit()
 
     def get_article_document(self, article_id: str):
         return self.conn.execute("SELECT * FROM article_documents WHERE article_id=?", (article_id,)).fetchone()

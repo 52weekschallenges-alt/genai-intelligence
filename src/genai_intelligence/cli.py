@@ -10,6 +10,8 @@ from pathlib import Path
 from .db import Repository
 from .pipeline import ingest_all, ingest_source
 from .sources import load_sources
+from .indexing import index_recent_documents
+from .weekly import build_weekly_edition
 
 
 def _default_registry() -> Path:
@@ -31,7 +33,9 @@ def main(argv: list[str] | None = None) -> int:
     one.add_argument("source_id")
     show = sub.add_parser("articles", help="List recent collected articles")
     show.add_argument("--limit", type=int, default=20)
-    sub.add_parser("stats", help="Show local database counts")
+    sub.add_parser("index", help="Fetch, extract, chunk, and embed eligible documents")
+    sub.add_parser("edition", help="Generate/resume the current week's long-form notebook edition")
+    sub.add_parser("stats", help="Show local database and index counts")
     args = parser.parse_args(argv)
 
     try:
@@ -58,6 +62,13 @@ def main(argv: list[str] | None = None) -> int:
                     print(json.dumps({"title": row["title"], "url": row["url"], "source_id": row["source_id"],
                                       "published_at": row["published_at"], "summary": row["summary"]}, ensure_ascii=False))
                 return 0
+            if args.command == "index":
+                print(json.dumps(index_recent_documents(repo), indent=2))
+                return 0
+            if args.command == "edition":
+                result = build_weekly_edition(repo)
+                print(json.dumps(result, indent=2))
+                return 0 if result.get("status") in {"published", "already_published", "in_progress", "waiting_for_index"} else 1
             if args.command == "stats":
                 print(json.dumps(repo.counts(), indent=2))
                 return 0

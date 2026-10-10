@@ -11,6 +11,10 @@
       "schedule": "0 2 * * *"
     },
     {
+      "path": "/api/cron/index",
+      "schedule": "0 3 * * *"
+    },
+    {
       "path": "/api/cron/edition",
       "schedule": "0 4 * * *"
     }

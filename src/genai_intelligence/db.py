@@ -49,9 +49,28 @@ CREATE TABLE IF NOT EXISTS weekly_editions (
   week_id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, article_ids_json TEXT NOT NULL,
   story_count INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'published'
 );
+CREATE TABLE IF NOT EXISTS article_documents (
+  article_id TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  body TEXT NOT NULL, content_hash TEXT NOT NULL, source_fingerprint TEXT NOT NULL,
+  extraction_method TEXT NOT NULL, content_scope TEXT NOT NULL, status TEXT NOT NULL,
+  indexed_at TEXT NOT NULL, embedding_model TEXT NOT NULL, chunk_count INTEGER NOT NULL DEFAULT 0,
+  error TEXT
+);
+CREATE TABLE IF NOT EXISTS article_chunks (
+  chunk_id TEXT PRIMARY KEY, article_id TEXT NOT NULL REFERENCES article_documents(article_id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL, content TEXT NOT NULL, embedding_json TEXT NOT NULL,
+  UNIQUE(article_id, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS idx_article_chunks_article ON article_chunks(article_id, chunk_index);
+CREATE TABLE IF NOT EXISTS article_analyses (
+  article_id TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  analysis_json TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+  document_hash TEXT NOT NULL, analysis_version INTEGER NOT NULL, created_at TEXT NOT NULL
+);
 """
 
 POSTGRES_SCHEMA = """
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS sources (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, url TEXT NOT NULL,
   categories_json TEXT NOT NULL DEFAULT '[]', trust_score DOUBLE PRECISION NOT NULL DEFAULT 0.5,
@@ -85,6 +104,25 @@ CREATE TABLE IF NOT EXISTS reading_progress (
 CREATE TABLE IF NOT EXISTS weekly_editions (
   week_id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, article_ids_json TEXT NOT NULL,
   story_count INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'published'
+);
+CREATE TABLE IF NOT EXISTS article_documents (
+  article_id TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  body TEXT NOT NULL, content_hash TEXT NOT NULL, source_fingerprint TEXT NOT NULL,
+  extraction_method TEXT NOT NULL, content_scope TEXT NOT NULL, status TEXT NOT NULL,
+  indexed_at TEXT NOT NULL, embedding_model TEXT NOT NULL, chunk_count INTEGER NOT NULL DEFAULT 0,
+  error TEXT
+);
+CREATE TABLE IF NOT EXISTS article_chunks (
+  chunk_id TEXT PRIMARY KEY, article_id TEXT NOT NULL REFERENCES article_documents(article_id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL, content TEXT NOT NULL, embedding vector(768) NOT NULL,
+  UNIQUE(article_id, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS idx_article_chunks_article ON article_chunks(article_id, chunk_index);
+CREATE INDEX IF NOT EXISTS idx_article_chunks_embedding ON article_chunks USING hnsw (embedding vector_cosine_ops);
+CREATE TABLE IF NOT EXISTS article_analyses (
+  article_id TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  analysis_json TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+  document_hash TEXT NOT NULL, analysis_version INTEGER NOT NULL, created_at TEXT NOT NULL
 );
 """
 
@@ -214,8 +252,12 @@ class Repository:
         return self.conn.execute("SELECT * FROM articles ORDER BY COALESCE(published_at,collected_at) DESC LIMIT ?", (limit,)).fetchall()
 
     def counts(self) -> dict[str, int]:
-        return {table: int(self.conn.execute(f"SELECT COUNT(*) AS total FROM {table}").fetchone()["total"])
-                for table in ("sources", "articles", "ingestion_runs")}
+        counts = {table: int(self.conn.execute(f"SELECT COUNT(*) AS total FROM {table}").fetchone()["total"])
+                  for table in ("sources", "articles", "ingestion_runs")}
+        counts["indexed_documents"] = int(self.conn.execute("SELECT COUNT(*) AS total FROM article_documents WHERE status='ready'").fetchone()["total"])
+        counts["indexed_chunks"] = int(self.conn.execute("SELECT COUNT(*) AS total FROM article_chunks").fetchone()["total"])
+        counts["long_form_analyses"] = int(self.conn.execute("SELECT COUNT(*) AS total FROM article_analyses").fetchone()["total"])
+        return counts
 
     def get_article(self, article_id: str):
         return self.conn.execute("SELECT * FROM articles WHERE id=?", (article_id,)).fetchone()
@@ -228,6 +270,92 @@ class Repository:
         self.conn.execute("""INSERT INTO article_studies(article_id,study_json,provider,model,created_at)
           VALUES(?,?,?,?,?) ON CONFLICT(article_id) DO NOTHING""",
           (article_id, json.dumps(study, ensure_ascii=False), provider, model, datetime.now(timezone.utc).isoformat()))
+        self.conn.commit()
+
+    def get_article_document(self, article_id: str):
+        return self.conn.execute("SELECT * FROM article_documents WHERE article_id=?", (article_id,)).fetchone()
+
+    def save_article_document(self, article_id: str, *, body: str, content_hash: str,
+                              source_fingerprint: str, extraction_method: str, content_scope: str,
+                              embedding_model: str, chunks: list[tuple[str, list[float]]],
+                              status: str = "ready", error: str | None = None) -> None:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute("""INSERT INTO article_documents
+          (article_id,body,content_hash,source_fingerprint,extraction_method,content_scope,status,indexed_at,embedding_model,chunk_count,error)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(article_id) DO UPDATE SET
+          body=excluded.body,content_hash=excluded.content_hash,source_fingerprint=excluded.source_fingerprint,
+          extraction_method=excluded.extraction_method,content_scope=excluded.content_scope,status=excluded.status,
+          indexed_at=excluded.indexed_at,embedding_model=excluded.embedding_model,chunk_count=excluded.chunk_count,error=excluded.error""",
+          (article_id, body, content_hash, source_fingerprint, extraction_method, content_scope, status,
+           now, embedding_model, len(chunks), error))
+        self.conn.execute("DELETE FROM article_chunks WHERE article_id=?", (article_id,))
+        for index, (content, vector) in enumerate(chunks):
+            chunk_id = hashlib.sha256(f"{article_id}\0{content_hash}\0{index}".encode()).hexdigest()
+            if self.backend == "postgres":
+                vector_text = "[" + ",".join(f"{float(value):.8f}" for value in vector) + "]"
+                self.conn.execute("INSERT INTO article_chunks(chunk_id,article_id,chunk_index,content,embedding) VALUES(?,?,?,?,?::vector)",
+                                  (chunk_id, article_id, index, content, vector_text))
+            else:
+                self.conn.execute("INSERT INTO article_chunks(chunk_id,article_id,chunk_index,content,embedding_json) VALUES(?,?,?,?,?)",
+                                  (chunk_id, article_id, index, content, json.dumps(vector)))
+        self.conn.commit()
+
+    def save_index_failure(self, article_id: str, *, source_fingerprint: str, error: str,
+                           embedding_model: str) -> None:
+        self.save_article_document(article_id, body="", content_hash="", source_fingerprint=source_fingerprint,
+                                   extraction_method="failed", content_scope="unavailable",
+                                   embedding_model=embedding_model, chunks=[], status="failed", error=error[:500])
+
+    def get_article_analysis(self, article_id: str):
+        return self.conn.execute("SELECT * FROM article_analyses WHERE article_id=?", (article_id,)).fetchone()
+
+    def save_article_analysis(self, article_id: str, analysis: dict, provider: str, model: str,
+                              document_hash: str, analysis_version: int) -> None:
+        from datetime import datetime, timezone
+        self.conn.execute("""INSERT INTO article_analyses
+          (article_id,analysis_json,provider,model,document_hash,analysis_version,created_at)
+          VALUES(?,?,?,?,?,?,?) ON CONFLICT(article_id) DO UPDATE SET
+          analysis_json=excluded.analysis_json,provider=excluded.provider,model=excluded.model,
+          document_hash=excluded.document_hash,analysis_version=excluded.analysis_version,created_at=excluded.created_at""",
+          (article_id, json.dumps(analysis, ensure_ascii=False), provider, model, document_hash,
+           analysis_version, datetime.now(timezone.utc).isoformat()))
+        self.conn.commit()
+
+    def related_indexed_chunks(self, article_id: str, *, limit: int = 8, threshold: float = 0.74) -> list[dict]:
+        if self.backend == "postgres":
+            own = self.conn.execute("SELECT embedding FROM article_chunks WHERE article_id=? ORDER BY chunk_index LIMIT 1", (article_id,)).fetchone()
+            if not own:
+                return []
+            vector = str(own["embedding"])
+            rows = self.conn.execute("""SELECT c.article_id,c.content,1-(c.embedding <=> ?::vector) AS similarity,
+              a.title,a.url,a.source_id FROM article_chunks c JOIN articles a ON a.id=c.article_id
+              WHERE c.article_id<>? ORDER BY c.embedding <=> ?::vector LIMIT ?""",
+              (vector, article_id, vector, limit)).fetchall()
+            return [dict(row) for row in rows if float(row["similarity"]) >= threshold]
+        rows = self.conn.execute("""SELECT c.article_id,c.content,c.embedding_json,a.title,a.url,a.source_id
+          FROM article_chunks c JOIN articles a ON a.id=c.article_id WHERE c.article_id<>?""", (article_id,)).fetchall()
+        own = self.conn.execute("SELECT embedding_json FROM article_chunks WHERE article_id=? ORDER BY chunk_index LIMIT 1", (article_id,)).fetchone()
+        if not own:
+            return []
+        query = json.loads(own["embedding_json"])
+        query_norm = sum(value * value for value in query) ** 0.5 or 1.0
+        scored = []
+        for row in rows:
+            vector = json.loads(row["embedding_json"])
+            denom = query_norm * (sum(value * value for value in vector) ** 0.5 or 1.0)
+            similarity = sum(left * right for left, right in zip(query, vector)) / denom
+            if similarity >= threshold:
+                scored.append({"article_id": row["article_id"], "content": row["content"],
+                               "title": row["title"], "url": row["url"], "source_id": row["source_id"],
+                               "similarity": similarity})
+        scored.sort(key=lambda row: row["similarity"], reverse=True)
+        return scored[:limit]
+
+    def update_weekly_draft(self, week_id: str, article_ids: list[str]) -> None:
+        from datetime import datetime, timezone
+        self.conn.execute("""UPDATE weekly_editions SET article_ids_json=?,story_count=?,status='draft',generated_at=?
+          WHERE week_id=?""", (json.dumps(article_ids), len(article_ids), datetime.now(timezone.utc).isoformat(), week_id))
         self.conn.commit()
 
     def mark_completed(self, article_id: str) -> None:

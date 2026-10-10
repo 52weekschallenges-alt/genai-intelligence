@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .curation import curate_articles
 from .db import Repository
-from .study import generate_study
+from .analysis import ANALYSIS_VERSION, generate_analysis
 
 logger = logging.getLogger("genai_intelligence.weekly")
 WEEKLY_STORY_COUNT = 6
-MAX_NEW_STUDIES_PER_RUN = 2
+MAX_NEW_STUDIES_PER_RUN = 3
 CATALOG_SOURCE_IDS = {"huggingface_models", "github_trending_ai"}
 
 
@@ -19,11 +19,12 @@ def build_weekly_edition(repo: Repository, *, now: datetime | None = None) -> di
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     week_id = now.strftime("%G-W%V")
     existing = repo.get_weekly_edition(week_id)
-    if existing and existing["status"] == "published":
-        return {"status": "already_published", "week_id": week_id,
-                "stories": existing["story_count"]}
-
-    rows = repo.conn.execute("SELECT * FROM articles ORDER BY COALESCE(published_at,collected_at) DESC LIMIT 10000").fetchall()
+    cutoff = (now - timedelta(days=7)).isoformat()
+    rows = repo.conn.execute("""SELECT a.*,d.body AS indexed_document,d.content_hash AS document_hash,
+      d.content_scope,d.extraction_method FROM articles a JOIN article_documents d ON d.article_id=a.id
+      WHERE d.status='ready' AND d.content_scope='full_text'
+      AND COALESCE(a.published_at,a.collected_at)>=?
+      ORDER BY COALESCE(a.published_at,a.collected_at) DESC LIMIT 1000""", (cutoff,)).fetchall()
     articles = []
     for row in rows:
         item = dict(row)
@@ -31,43 +32,62 @@ def build_weekly_edition(repo: Repository, *, now: datetime | None = None) -> di
         item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
         articles.append(item)
     by_id = {str(item["id"]): item for item in articles}
-    if existing:
-        article_ids = json.loads(existing["article_ids_json"])
+    selected = curate_articles(articles, now=now, limit=WEEKLY_STORY_COUNT)
+    candidate_ids = [str(item["id"]) for item in selected]
+    if existing and existing["status"] == "published":
+        current_ids = json.loads(existing["article_ids_json"])
+        up_to_date = all(
+            (saved := repo.get_article_analysis(article_id))
+            and saved["analysis_version"] == ANALYSIS_VERSION
+            and article_id in by_id and saved["document_hash"] == by_id[article_id]["document_hash"]
+            for article_id in current_ids
+        )
+        if up_to_date:
+            return {"status": "already_published", "week_id": week_id,
+                    "stories": existing["story_count"]}
+    if existing and existing["status"] == "draft":
+        old_ids = json.loads(existing["article_ids_json"])
+        article_ids = [article_id for article_id in old_ids if article_id in by_id]
+        article_ids.extend(article_id for article_id in candidate_ids if article_id not in article_ids)
+        article_ids = article_ids[:WEEKLY_STORY_COUNT]
     else:
-        # Model catalog entries often have only a model ID and tags; they are
-        # useful in the archive but too thin to become a synthesized newspaper story.
-        readable = [item for item in articles
-                    if item.get("source_id") not in CATALOG_SOURCE_IDS
-                    and len(str(item.get("summary") or item.get("content") or "").strip()) >= 80]
-        selected = curate_articles(readable, now=now, limit=WEEKLY_STORY_COUNT)
-        article_ids = [str(item["id"]) for item in selected]
-        if not article_ids:
-            return {"status": "waiting_for_stories", "week_id": week_id, "stories": 0}
+        article_ids = candidate_ids
+    if existing:
+        repo.update_weekly_draft(week_id, article_ids)
+    else:
         repo.save_weekly_draft(week_id, article_ids)
+    if not article_ids:
+        return {"status": "waiting_for_index", "week_id": week_id, "stories": 0}
 
     generated_this_run = 0
     for article_id in article_ids:
-        saved = repo.get_study(article_id)
-        if not saved:
+        saved = repo.get_article_analysis(article_id)
+        primary = by_id[article_id]
+        if not saved or saved["document_hash"] != primary["document_hash"] or saved["analysis_version"] != ANALYSIS_VERSION:
             if generated_this_run >= MAX_NEW_STUDIES_PER_RUN:
-                prepared = sum(1 for saved_id in article_ids if repo.get_study(saved_id))
+                prepared = sum(1 for saved_id in article_ids
+                               if (cached := repo.get_article_analysis(saved_id))
+                               and cached["analysis_version"] == ANALYSIS_VERSION
+                               and saved_id in by_id
+                               and cached["document_hash"] == by_id[saved_id]["document_hash"])
                 return {"status": "in_progress", "week_id": week_id,
                         "prepared_stories": prepared,
                         "total_stories": len(article_ids)}
             try:
-                study, provider, model = generate_study(by_id[article_id])
+                related = repo.related_indexed_chunks(article_id, limit=8)
+                analysis, provider, model = generate_analysis(primary, related)
             except Exception as exc:
-                prepared = sum(1 for saved_id in article_ids if repo.get_study(saved_id))
+                prepared = sum(1 for saved_id in article_ids
+                               if (cached := repo.get_article_analysis(saved_id))
+                               and cached["analysis_version"] == ANALYSIS_VERSION
+                               and saved_id in by_id
+                               and cached["document_hash"] == by_id[saved_id]["document_hash"])
                 logger.warning("Weekly issue %s paused at article %s (%s)",
                                week_id, article_id[:10], type(exc).__name__)
                 return {"status": "waiting_for_provider", "week_id": week_id,
                         "prepared_stories": prepared, "remaining": len(article_ids) - prepared}
-            primary = by_id[article_id]
-            study["evidence_sources"] = [{"source_id": primary.get("source_id"), "title": primary.get("title"), "url": primary.get("url")}] + [
-                {"source_id": source.get("source_id"), "title": source.get("title"), "url": source.get("url")}
-                for source in primary.get("related_sources", [])[:3]
-            ]
-            repo.save_study(article_id, study, provider, model)
+            repo.save_article_analysis(article_id, analysis, provider, model,
+                                       primary["document_hash"], ANALYSIS_VERSION)
             generated_this_run += 1
 
     repo.publish_weekly_edition(week_id)

@@ -24,6 +24,9 @@ from .sources import load_sources
 from .study import generate_study
 from .weekly import build_weekly_edition
 
+CATALOG_SOURCE_IDS = {"huggingface_models", "github_trending_ai"}
+MIN_STORY_TEXT_CHARS = 80
+
 
 def _database_path() -> str:
     return os.getenv("GENAI_INTEL_DB", "data/genai_intelligence.sqlite3")
@@ -65,8 +68,19 @@ def _source_label(source_id: object) -> str:
 
 def _external_url(value: object) -> str:
     url = str(value or "").strip()
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
     return url if parsed.scheme in {"http", "https"} and parsed.netloc else ""
+
+
+def _is_newspaper_story(item: dict) -> bool:
+    """Keep catalog records and empty feed entries out of the newspaper view."""
+    if str(item.get("source_id") or "") in CATALOG_SOURCE_IDS:
+        return False
+    detail = str(item.get("summary") or item.get("content") or "").strip()
+    return len(detail) >= MIN_STORY_TEXT_CHARS
 
 
 def _run_ingestion() -> list[dict]:
@@ -253,6 +267,9 @@ def _articles(q: str, source: str, category: str, limit: int, offset: int,
                 if study_row:
                     item["weekly_analysis"] = json.loads(study_row["study_json"])
             data.append(item)
+        if edition != "all":
+            data = [item for item in data if _is_newspaper_story(item)]
+            total = len(data)
         if edition != "all" and not issue_ids:
             data = curate_articles(data, limit=max(BRIEFING_SIZE, limit + offset))
             total = len(data)
@@ -329,7 +346,7 @@ def issue_page(week_id: str) -> str:
         for article_id in article_ids:
             row = repo.get_article(article_id)
             study = repo.get_study(article_id)
-            if row and study:
+            if row and study and _is_newspaper_story(dict(row)):
                 articles.append((dict(row), json.loads(study["study_json"])))
     finally:
         repo.close()

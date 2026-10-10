@@ -12,6 +12,7 @@ from .study import generate_study
 logger = logging.getLogger("genai_intelligence.weekly")
 WEEKLY_STORY_COUNT = 6
 MAX_NEW_STUDIES_PER_RUN = 2
+CATALOG_SOURCE_IDS = {"huggingface_models", "github_trending_ai"}
 
 
 def build_weekly_edition(repo: Repository, *, now: datetime | None = None) -> dict:
@@ -36,7 +37,8 @@ def build_weekly_edition(repo: Repository, *, now: datetime | None = None) -> di
         # Model catalog entries often have only a model ID and tags; they are
         # useful in the archive but too thin to become a synthesized newspaper story.
         readable = [item for item in articles
-                    if len(str(item.get("summary") or item.get("content") or "").strip()) >= 80]
+                    if item.get("source_id") not in CATALOG_SOURCE_IDS
+                    and len(str(item.get("summary") or item.get("content") or "").strip()) >= 80]
         selected = curate_articles(readable, now=now, limit=WEEKLY_STORY_COUNT)
         article_ids = [str(item["id"]) for item in selected]
         if not article_ids:

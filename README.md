@@ -11,6 +11,7 @@ A free-first, source-linked GenAI weekly notebook. It collects public RSS/Atom f
 - A daily briefing of up to 20 items from the last seven days, ranked by freshness, source trust, headline signals, and available community engagement.
 - Duplicate-title and URL suppression plus a three-story-per-source cap to make the briefing more varied. Each selected story shows the rules that helped it qualify.
 - A full archive remains available from the **All articles** view; items are not deleted by curation.
+- The weekly newspaper excludes Hugging Face model-catalog and GitHub repository-search records, plus any item without at least 80 characters of readable source text. Those directory records remain in the underlying library; they are not presented as news stories.
 - Articles are classified individually into the agreed eight radar topics: foundation models, agentic AI, frameworks/tools, RAG/retrieval, benchmarks/evaluation, AI research, inference/infrastructure, and startups/products. The site exposes these as topic navigation; source-wide labels no longer determine every article's topic.
 - Topic assignment currently uses transparent keyword rules over each article's title, abstract/summary, body, and feed tags. Existing database rows are reclassified once on first startup after this update. Items without a strong keyword match fall into AI research so every document stays discoverable.
 - A rolling seven-day reader labeled **This week**, plus a full library archive.

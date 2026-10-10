@@ -368,6 +368,27 @@ def status_api() -> dict:
         pipeline_rows = repo.conn.execute("""SELECT p.* FROM pipeline_runs p JOIN (
           SELECT phase,MAX(started_at) AS latest FROM pipeline_runs GROUP BY phase
         ) latest ON latest.phase=p.phase AND latest.latest=p.started_at ORDER BY p.phase""").fetchall()
+        pipeline_by_phase = {row["phase"]: dict(row) for row in pipeline_rows}
+        # Older deployments have source/document/edition records but no phase-level
+        # telemetry yet. Surface that evidence honestly until the first tracked cron run.
+        if "collect" not in pipeline_by_phase:
+            last_collect = repo.conn.execute("SELECT MAX(started_at) AS at FROM ingestion_runs").fetchone()["at"]
+            if last_collect:
+                pipeline_by_phase["collect"] = {"phase": "collect", "started_at": last_collect,
+                    "finished_at": None, "status": "observed", "error": None,
+                    "detail_json": json.dumps({"result": {"note": "Existing source history; tracked run history begins after this deployment."}})}
+        if "index" not in pipeline_by_phase:
+            last_index = repo.conn.execute("SELECT MAX(indexed_at) AS at FROM article_documents").fetchone()["at"]
+            if last_index:
+                pipeline_by_phase["index"] = {"phase": "index", "started_at": last_index,
+                    "finished_at": None, "status": "observed", "error": None,
+                    "detail_json": json.dumps({"result": {"note": "Last saved document index; tracked run history begins after this deployment."}})}
+        if "edition" not in pipeline_by_phase:
+            last_edition = repo.conn.execute("SELECT MAX(generated_at) AS at FROM weekly_editions").fetchone()["at"]
+            if last_edition:
+                pipeline_by_phase["edition"] = {"phase": "edition", "started_at": last_edition,
+                    "finished_at": None, "status": "observed", "error": None,
+                    "detail_json": json.dumps({"result": {"note": "Last saved edition activity; tracked run history begins after this deployment."}})}
         current_week = datetime.now(timezone.utc).strftime("%G-W%V")
         edition = repo.get_weekly_edition(current_week)
         documents = repo.conn.execute("SELECT status,COUNT(*) AS total FROM article_documents GROUP BY status").fetchall()
@@ -385,7 +406,7 @@ def status_api() -> dict:
             "pipeline": [{
                 "phase": row["phase"], "started_at": row["started_at"], "finished_at": row["finished_at"],
                 "status": row["status"], "error": row["error"], "detail": json.loads(row["detail_json"] or "{}"),
-            } for row in pipeline_rows],
+            } for row in pipeline_by_phase.values()],
             "sources": [{
                 "id": row["id"], "name": row["name"], "type": row["type"], "url": row["url"],
                 "checked_at": row["checked_at"], "last_status": row["last_status"],

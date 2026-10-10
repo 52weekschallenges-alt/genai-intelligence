@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import html
 import json
 import logging
@@ -11,7 +12,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode, urlsplit, quote
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse
@@ -156,6 +157,81 @@ def _track_pipeline_phase(phase: str, operation) -> dict:
         finally:
             repo.close()
         raise
+
+
+def _probe_provider(service: str, model: str, key: str) -> tuple[str, int, str]:
+    """Check provider/model reachability without generating text or embeddings."""
+    import time
+    import httpx
+
+    started = time.monotonic()
+    if service == "groq_chat":
+        response = httpx.get("https://api.groq.com/openai/v1/models", timeout=5.0,
+                             headers={"Authorization": f"Bearer {key}"})
+        response.raise_for_status()
+        available = any(item.get("id") == model and item.get("active", True)
+                        for item in response.json().get("data", []))
+        if not available:
+            return "model_unavailable", round((time.monotonic() - started) * 1000), f"API reachable; configured model {model} is not listed"
+    else:
+        endpoint = "https://generativelanguage.googleapis.com/v1beta/models/" + quote(model, safe="")
+        response = httpx.get(endpoint, timeout=5.0, headers={"x-goog-api-key": key})
+        response.raise_for_status()
+    return "reachable", round((time.monotonic() - started) * 1000), f"Configured model {model} is available"
+
+
+def _refresh_provider_health(repo: Repository) -> list[dict]:
+    """Refresh provider metadata checks at most every 15 minutes across instances."""
+    now = datetime.now(timezone.utc)
+    checked_at = now.isoformat()
+    stale_before = (now.timestamp() - 15 * 60)
+    stale_before_iso = datetime.fromtimestamp(stale_before, timezone.utc).isoformat()
+    specs = [
+        ("groq_chat", "Groq · text generation", os.getenv("GROQ_API_KEY", "").strip(), os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")),
+        ("gemini_generation", "Gemini · text generation", os.getenv("GEMINI_API_KEY", "").strip(), os.getenv("GEMINI_MODEL", "gemini-3.8-flash")),
+        ("gemini_embeddings", "Gemini · embeddings", os.getenv("GEMINI_API_KEY", "").strip(), os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")),
+    ]
+    reserved = []
+    for service, label, key, model in specs:
+        if key and repo.reserve_service_health_check(service, checked_at, stale_before_iso):
+            reserved.append((service, label, key, model))
+    if reserved:
+        with ThreadPoolExecutor(max_workers=len(reserved)) as pool:
+            pending = {item[0]: pool.submit(_probe_provider, item[0], item[3], item[2]) for item in reserved}
+            for service, label, key, model in reserved:
+                try:
+                    status, latency, detail = pending[service].result(timeout=6.0)
+                except FutureTimeout:
+                    status, latency, detail = "timeout", None, "Provider metadata request timed out"
+                except Exception as exc:
+                    response = getattr(exc, "response", None)
+                    code = response.status_code if response is not None else None
+                    if code == 401:
+                        status, detail = "unauthorized", "Provider rejected the configured API key (HTTP 401)"
+                    elif code == 403:
+                        status, detail = "forbidden", "Provider denied access to the configured model (HTTP 403)"
+                    elif code == 404:
+                        status, detail = "model_unavailable", f"Configured model {model} was not found (HTTP 404)"
+                    elif code == 429:
+                        status, detail = "rate_limited", "Provider health endpoint returned HTTP 429"
+                    elif code:
+                        status, detail = "http_error", f"Provider health endpoint returned HTTP {code}"
+                    else:
+                        status, detail = "unreachable", type(exc).__name__
+                    latency = None
+                repo.save_service_health(service, checked_at, status, latency, detail)
+    latest = {row["service"]: dict(row) for row in repo.conn.execute("SELECT * FROM external_service_health").fetchall()}
+    output = []
+    for service, label, key, model in specs:
+        if not key:
+            output.append({"service": service, "name": label, "model": model, "status": "not_configured",
+                           "checked_at": None, "latency_ms": None, "detail": "API key is not configured"})
+        else:
+            item = latest.get(service, {})
+            output.append({"service": service, "name": label, "model": model,
+                           "status": item.get("status", "checking"), "checked_at": item.get("checked_at"),
+                           "latency_ms": item.get("latency_ms"), "detail": item.get("detail", "Health check in progress")})
+    return output
 
 
 async def _scheduled_ingestion() -> None:
@@ -351,6 +427,7 @@ def status_api() -> dict:
     """Read-only operations snapshot; never returns configured secret values."""
     repo = Repository(_database_path())
     try:
+        provider_health = _refresh_provider_health(repo)
         counts = {
             "articles": int(repo.conn.execute("SELECT COUNT(*) AS total FROM articles").fetchone()["total"]),
             "sources": int(repo.conn.execute("SELECT COUNT(*) AS total FROM sources WHERE enabled=1").fetchone()["total"]),
@@ -392,6 +469,9 @@ def status_api() -> dict:
         current_week = datetime.now(timezone.utc).strftime("%G-W%V")
         edition = repo.get_weekly_edition(current_week)
         documents = repo.conn.execute("SELECT status,COUNT(*) AS total FROM article_documents GROUP BY status").fetchall()
+        last_analysis = repo.conn.execute("SELECT provider,model,created_at FROM article_analyses ORDER BY created_at DESC LIMIT 1").fetchone()
+        last_study = repo.conn.execute("SELECT provider,model,created_at FROM article_studies ORDER BY created_at DESC LIMIT 1").fetchone()
+        last_embedding = repo.conn.execute("SELECT status,indexed_at,embedding_model,error FROM article_documents ORDER BY indexed_at DESC LIMIT 1").fetchone()
         return {
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "database": {"status": "connected", "backend": repo.backend},
@@ -400,6 +480,10 @@ def status_api() -> dict:
                 "embedding_key_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
                 "study_and_analysis_provider_configured": bool(os.getenv("GROQ_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip()),
             },
+            "providers": provider_health,
+            "last_successful_analysis": dict(last_analysis) if last_analysis else None,
+            "last_successful_study_kit": dict(last_study) if last_study else None,
+            "last_embedding_attempt": dict(last_embedding) if last_embedding else None,
             "counts": counts,
             "documents_by_status": {row["status"]: int(row["total"]) for row in documents},
             "current_edition": dict(edition) if edition else None,
@@ -495,15 +579,30 @@ def status_page() -> str:
 
     endpoint_rows = "".join(f'<tr><td><code>{esc(endpoint["path"])}</code></td><td>{esc(endpoint["purpose"])}</td><td><span class="pill good">registered</span></td></tr>' for endpoint in snapshot["internal_endpoints"])
     sources_html = "".join(source_rows) or '<tr><td colspan="4">No sources are registered yet.</td></tr>'
+    provider_rows = []
+    for provider in snapshot["providers"]:
+        status = provider["status"]
+        css = "good" if status == "reachable" else "muted" if status == "not_configured" else "warn" if status in {"checking", "rate_limited", "timeout"} else "bad"
+        latency = f'{provider["latency_ms"]} ms' if provider["latency_ms"] is not None else "—"
+        provider_rows.append(f'<tr><td>{esc(provider["name"])}<small>Model: {esc(provider["model"])}</small></td><td><span class="pill {css}">{esc(status.replace("_", " "))}</span><small>{esc(provider["detail"])}</small></td><td>{stamp(provider["checked_at"])}</td><td>{latency}</td></tr>')
+    providers_html = "".join(provider_rows)
     count = snapshot["counts"]
     current = snapshot["current_edition"]
     edition_status = current["status"] if current else "not started"
+    embedding = snapshot["last_embedding_attempt"]
+    embedding_status = f'{embedding["status"]} · {stamp(embedding["indexed_at"])} · {embedding["embedding_model"]}' if embedding else "No embedding attempt recorded"
+    embedding_error = f' · {embedding["error"]}' if embedding and embedding.get("error") else ""
+    analysis = snapshot["last_successful_analysis"]
+    analysis_status = f'{analysis["provider"]} / {analysis["model"]} · {stamp(analysis["created_at"])}' if analysis else "No successful long-form generation recorded"
+    study = snapshot["last_successful_study_kit"]
+    study_status = f'{study["provider"]} / {study["model"]} · {stamp(study["created_at"])}' if study else "No successful study-kit generation recorded"
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60"><title>System status · GenAI Intelligence</title><style>
 *{{box-sizing:border-box}}body{{margin:0;background:#f4f6f8;color:#172536;font:15px/1.5 system-ui,sans-serif}}main{{max-width:1100px;margin:30px auto;padding:0 18px}}header,.card,.panel{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px;margin:14px 0}}header h1{{margin:0}}header p,small,.muted{{color:#64748b}}.top{{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}}a{{color:#2859c5}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:12px}}.card{{margin:0}}.card h2{{margin:0;font-size:1.05rem}}.card p{{margin:10px 0 0;color:#64748b}}.row{{display:flex;justify-content:space-between;gap:8px;align-items:center}}.pill{{display:inline-block;border-radius:99px;padding:3px 9px;font-size:.8rem;font-weight:650;text-transform:capitalize;background:#eef2f7;color:#475569}}.good{{background:#e7f7ef;color:#167448}}.warn{{background:#fff4d8;color:#885b00}}.bad,.error{{color:#b42318}}.bad{{background:#fdebea}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px 8px;text-align:left;border-top:1px solid #e2e8f0;vertical-align:top}}th{{font-size:.8rem;color:#64748b}}td small{{display:block;overflow-wrap:anywhere}}.scroll{{overflow:auto}}.metrics{{display:flex;gap:10px;flex-wrap:wrap}}.metric{{padding:10px 13px;background:#f7f9fc;border-radius:8px}}.metric strong{{font-size:1.2rem}}code{{font-size:.9em}}@media(max-width:650px){{main{{margin-top:14px}}th:nth-child(3),td:nth-child(3){{display:none}}}}
 </style></head><body><main><header><div class="top"><div><h1>System status</h1><p>Pipeline progress and last known source checks. Refreshes every 60 seconds.</p></div><a href="/">← Back to newspaper</a></div><p>Updated {stamp(snapshot["checked_at"])} · Database: <span class="pill good">{esc(snapshot["database"]["status"])} ({esc(snapshot["database"]["backend"])})</span> · Current edition: <span class="pill">{esc(edition_status)}</span></p></header>
 <section class="panel"><h2>Library progress</h2><div class="metrics"><span class="metric"><strong>{count["sources"]}</strong> enabled sources</span><span class="metric"><strong>{count["articles"]:,}</strong> collected articles</span><span class="metric"><strong>{count["indexed_ready"]:,}</strong> indexed docs</span><span class="metric"><strong>{count["indexed_full_text"]:,}</strong> full text</span><span class="metric"><strong>{count["indexed_failed"]:,}</strong> indexing failures</span><span class="metric"><strong>{count["analyses"]:,}</strong> deep reads</span><span class="metric"><strong>{count["published_editions"]:,}</strong> saved editions</span></div></section>
 <h2>Scheduled pipeline</h2><div class="grid">{"".join(phase_cards)}</div>
 <section class="panel"><h2>External feeds and APIs</h2><p>These show the outcome of the latest scheduled collection; opening a row visits that source.</p><div class="scroll"><table><thead><tr><th>Source endpoint</th><th>Last result</th><th>Last checked</th><th>Collection</th></tr></thead><tbody>{sources_html}</tbody></table></div></section>
+<section class="panel"><h2>LLM and embedding endpoint health</h2><p>Checks call provider model-metadata endpoints every 15 minutes at most. They verify the key and configured model can be reached; they do not generate text or embeddings or consume model tokens.</p><div class="scroll"><table><thead><tr><th>Provider/model</th><th>Reachability</th><th>Last checked</th><th>Response</th></tr></thead><tbody>{providers_html}</tbody></table></div><h3>Last successful real work</h3><p>Embedding: {esc(embedding_status)}{esc(embedding_error)}</p><p>Long-form analysis: {esc(analysis_status)}</p><p>Study kit: {esc(study_status)}</p></section>
 <section class="panel"><h2>App endpoints</h2><div class="scroll"><table><thead><tr><th>Route</th><th>Purpose</th><th>Status</th></tr></thead><tbody>{endpoint_rows}</tbody></table></div><p>Protected cron routes are called by Vercel on schedule. Their run outcomes appear above; secret values are never shown.</p></section>
 <section class="panel"><h2>Configuration checks</h2><p>Database connection: <span class="pill good">Connected</span></p><p>Scheduled-job secret: <span class="pill {"good" if snapshot["configuration"]["cron_secret_configured"] else "bad"}">{"configured" if snapshot["configuration"]["cron_secret_configured"] else "missing"}</span></p><p>Embedding key: <span class="pill {"good" if snapshot["configuration"]["embedding_key_configured"] else "bad"}">{"configured" if snapshot["configuration"]["embedding_key_configured"] else "missing"}</span></p><p>Analysis/study provider: <span class="pill {"good" if snapshot["configuration"]["study_and_analysis_provider_configured"] else "bad"}">{"configured" if snapshot["configuration"]["study_and_analysis_provider_configured"] else "missing"}</span></p></section>
 <p class="muted">This dashboard reports recorded checks and configuration presence; it does not make extra paid monitoring or model calls.</p></main></body></html>'''

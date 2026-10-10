@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
   finished_at TEXT, status TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '{}', error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_phase_started ON pipeline_runs(phase, started_at DESC);
+CREATE TABLE IF NOT EXISTS external_service_health (
+  service TEXT PRIMARY KEY, checked_at TEXT NOT NULL, status TEXT NOT NULL,
+  latency_ms INTEGER, detail TEXT
+);
 CREATE TABLE IF NOT EXISTS weekly_editions (
   week_id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, article_ids_json TEXT NOT NULL,
   story_count INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'published'
@@ -117,6 +121,10 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
   finished_at TEXT, status TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '{}', error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_phase_started ON pipeline_runs(phase, started_at DESC);
+CREATE TABLE IF NOT EXISTS external_service_health (
+  service TEXT PRIMARY KEY, checked_at TEXT NOT NULL, status TEXT NOT NULL,
+  latency_ms INTEGER, detail TEXT
+);
 CREATE TABLE IF NOT EXISTS weekly_editions (
   week_id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, article_ids_json TEXT NOT NULL,
   story_count INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'published'
@@ -314,6 +322,21 @@ class Repository:
             "UPDATE pipeline_runs SET finished_at=?,status=?,detail_json=?,error=? WHERE id=?",
             (finished_at, status, json.dumps(detail or {}, ensure_ascii=False, default=str), error, run_id),
         )
+        self.conn.commit()
+
+    def reserve_service_health_check(self, service: str, checked_at: str, stale_before: str) -> bool:
+        result = self.conn.execute("""INSERT INTO external_service_health(service,checked_at,status,detail)
+          VALUES(?,?,'checking','Health check in progress')
+          ON CONFLICT(service) DO UPDATE SET checked_at=excluded.checked_at,status='checking',
+          latency_ms=NULL,detail='Health check in progress'
+          WHERE external_service_health.checked_at<?""", (service, checked_at, stale_before))
+        self.conn.commit()
+        return result.rowcount == 1
+
+    def save_service_health(self, service: str, checked_at: str, status: str,
+                            latency_ms: int | None, detail: str) -> None:
+        self.conn.execute("""UPDATE external_service_health SET checked_at=?,status=?,latency_ms=?,detail=?
+          WHERE service=?""", (checked_at, status, latency_ms, detail[:300], service))
         self.conn.commit()
 
     def get_article_document(self, article_id: str):

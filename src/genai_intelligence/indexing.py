@@ -199,7 +199,7 @@ def _fresh(existing: dict | None, fingerprint: str, *, now: datetime, model: str
         return False
     age = now - checked.astimezone(timezone.utc)
     if (existing["source_fingerprint"] == fingerprint and existing["embedding_model"] == model
-            and existing["status"] == "failed" and age < timedelta(hours=12)):
+            and existing["status"] == "failed" and age < timedelta(days=7)):
         return True
     return (existing["status"] == "ready" and existing["source_fingerprint"] == fingerprint
             and existing["embedding_model"] == model and age < timedelta(days=30))

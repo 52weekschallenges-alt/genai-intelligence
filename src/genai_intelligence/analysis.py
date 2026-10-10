@@ -111,8 +111,11 @@ def _groq(prompt: str) -> tuple[dict, str]:
                              endpoint="api.groq.com/openai/v1/chat/completions") as trace:
         response = httpx.post("https://api.groq.com/openai/v1/chat/completions", timeout=TIMEOUT,
             headers={"Authorization": f"Bearer {key}"},
-            json={"model": model, "temperature": 0.2, "max_tokens": 2600,
+            json={"model": model, "temperature": 0.2, "max_completion_tokens": 2600,
                   "response_format": {"type": "json_object"},
+                  # GPT-OSS requires hidden or parsed reasoning when JSON mode
+                  # is enabled; raw reasoning can make the response invalid.
+                  "reasoning_format": "hidden",
                   "messages": [{"role": "user", "content": prompt}]})
         trace["http_status"] = response.status_code
         response.raise_for_status()
@@ -131,7 +134,7 @@ def _gemini(prompt: str) -> tuple[dict, str]:
             timeout=TIMEOUT, headers={"x-goog-api-key": key},
             json={"contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {"temperature": 0.2, "maxOutputTokens": 3800,
-                    "responseFormat": {"text": {"mimeType": "application/json", "schema": {
+                    "responseFormat": {"text": {"mimeType": "APPLICATION_JSON", "schema": {
                       "type": "object",
                       "properties": {
                         "executive_takeaway": {"type": "string"},

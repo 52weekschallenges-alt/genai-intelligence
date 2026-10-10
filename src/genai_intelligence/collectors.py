@@ -11,6 +11,7 @@ import httpx
 
 from .models import Article, parse_datetime
 from .sources import Source
+from .classification import classify_article
 
 USER_AGENT = "GenAI-Intelligence/0.1 (+local research reader)"
 
@@ -41,11 +42,15 @@ def _article(source: Source, *, title: Any, url: Any, item_id: Any = None,
     url = str(url or "").strip()
     if not title or not url:
         return None
+    cleaned_summary = _clean_html(str(summary)) if summary else None
+    cleaned_content = _clean_html(str(content)) if content else None
+    article_tags = list(categories or [])
     return Article(source_id=source.id, source_name=source.name, title=title, url=url,
-                   item_id=str(item_id) if item_id else None, summary=_clean_html(str(summary)) if summary else None,
-                   content=_clean_html(str(content)) if content else None, author=str(author) if author else None,
+                   item_id=str(item_id) if item_id else None, summary=cleaned_summary,
+                   content=cleaned_content, author=str(author) if author else None,
                    published_at=parse_datetime(published), updated_at=parse_datetime(updated),
-                   categories=list(dict.fromkeys(source.categories + (categories or []))),
+                   categories=classify_article(title=title, summary=cleaned_summary or "",
+                                               content=cleaned_content or "", tags=article_tags),
                    trust_score=source.trust_score, metadata=metadata or {})
 
 

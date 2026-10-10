@@ -13,6 +13,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
 
 from .curation import BRIEFING_SIZE, curate_articles
+from .classification import CATEGORY_LABELS
 from .db import Repository
 from .pipeline import ingest_all
 from .sources import load_sources
@@ -129,13 +130,7 @@ def _articles(q: str, source: str, category: str, limit: int, offset: int,
             total = len(data)
             data = data[offset:offset + limit]
         sources = [dict(row) for row in repo.conn.execute("SELECT id,name FROM sources WHERE enabled=1 ORDER BY name")]
-        if repo.backend == "postgres":
-            categories = [r["value"] for r in repo.conn.execute("""SELECT DISTINCT cat.value AS value FROM articles a
-                CROSS JOIN LATERAL jsonb_array_elements_text(a.categories_json::jsonb) AS cat(value)
-                WHERE cat.value != '' ORDER BY cat.value""")]
-        else:
-            categories = [r["value"] for r in repo.conn.execute("""SELECT DISTINCT j.value AS value FROM articles a, json_each(a.categories_json) j
-                WHERE j.value != '' ORDER BY j.value""")]
+        categories = list(CATEGORY_LABELS)
         pool_total = int(repo.conn.execute("SELECT COUNT(*) AS total FROM articles").fetchone()["total"])
         return data, total, {"articles": total, "pool_total": pool_total, "sources": len(sources),
                              "categories": len(categories)} | {"_sources": sources, "_categories": categories}
@@ -181,7 +176,7 @@ def home(request: Request, q: str = "", source: str = "", category: str = "",
         selected = " selected" if value == current else ""
         return f'<option value="{html.escape(value, quote=True)}"{selected}>{html.escape(label)}</option>'
     source_options = option("", "All sources", source) + "".join(option(s["id"], s["name"], source) for s in sources)
-    category_options = option("", "All topics", category) + "".join(option(c, c.replace("_", " ").title(), category) for c in categories)
+    category_options = option("", "All topics", category) + "".join(option(c, CATEGORY_LABELS.get(c, c.replace("_", " ").title()), category) for c in categories)
     cards = []
     for item in items:
         published = item.get("published_at") or item.get("collected_at")
@@ -192,7 +187,7 @@ def home(request: Request, q: str = "", source: str = "", category: str = "",
             except (ValueError, AttributeError):
                 date_label = published[:10]
         summary = item.get("summary") or item.get("content") or "Open the original source for the full article."
-        chips = "".join(f'<span class="tag">{html.escape(c.replace("_", " "))}</span>' for c in item["categories"][:4])
+        chips = "".join(f'<span class="tag">{html.escape(CATEGORY_LABELS.get(c, c.replace("_", " ").title()))}</span>' for c in item["categories"][:4])
         why = " · ".join(item.get("selection_reasons", []))
         editorial_note = f'<div class="why">Why it made the briefing: {html.escape(why)}</div>' if why and edition == "briefing" else ""
         cards.append(f'''<article class="card"><div class="meta"><span>{html.escape(item["source_id"].replace("_", " ").title())}</span><span>{html.escape(date_label)}</span></div>
@@ -205,14 +200,23 @@ def home(request: Request, q: str = "", source: str = "", category: str = "",
     pagination = ((page_link(page - 1, "← Newer") if page > 1 else "") + (page_link(page + 1, "Older →") if page < pages else "")) if edition == "all" else ""
     briefing_url = "/?" + urlencode({k: v for k, v in {"q": q, "source": source, "category": category}.items() if v})
     archive_url = "/?" + urlencode({k: v for k, v in {"q": q, "source": source, "category": category, "edition": "all"}.items() if v})
+    topic_base = {k: v for k, v in {"q": q, "source": source, "edition": edition}.items() if v}
+    all_topics_url = "/?" + urlencode(topic_base)
+    topic_links = []
+    for topic in categories:
+        topic_params = topic_base | {"category": topic}
+        active = "active" if category == topic else ""
+        label = html.escape(CATEGORY_LABELS.get(topic, topic.replace("_", " ").title()))
+        topic_links.append(f'<a class="{active}" href="/?{urlencode(topic_params)}">{label}</a>')
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="description" content="A source-linked daily briefing on important developments across generative AI."><title>GenAI Intelligence</title>
 <style>
 :root{{--ink:#172536;--muted:#64748b;--paper:#f5f7fa;--line:#e2e8f0;--accent:#2859c5}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:16px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}header{{background:#10253d;color:white;padding:34px max(calc((100vw - 1000px)/2),24px) 30px}}header h1{{font-family:Georgia,serif;font-size:clamp(2rem,5vw,3.25rem);line-height:1.05;margin:0 0 10px;letter-spacing:-.04em}}header p{{margin:0;color:#c3d2e5;max-width:620px}}main{{max-width:1000px;margin:25px auto;padding:0 20px}}.stats{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}.stat{{background:white;border:1px solid var(--line);border-radius:8px;padding:9px 13px;color:var(--muted);font-size:.9rem}}.stat strong{{color:var(--ink)}}form{{display:grid;grid-template-columns:1fr 180px 180px auto;gap:9px;background:white;border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:18px}}input,select,button{{font:inherit;border:1px solid var(--line);border-radius:7px;padding:10px 12px;background:white;color:var(--ink)}}button{{background:var(--accent);color:white;border-color:var(--accent);font-weight:600;cursor:pointer}}.card{{background:white;border:1px solid var(--line);border-radius:10px;padding:20px 22px;margin:12px 0;box-shadow:0 2px 8px #16263b08}}.meta{{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.05em}}h2{{font-family:Georgia,serif;font-size:1.4rem;line-height:1.25;margin:10px 0}}h2 a{{color:var(--ink);text-decoration:none}}h2 a:hover{{color:var(--accent)}}.card p{{color:#475569;margin:0 0 12px}}.tags{{display:flex;gap:6px;flex-wrap:wrap}}.tag{{font-size:.76rem;text-transform:capitalize;background:#eef3ff;color:#34569c;border-radius:99px;padding:3px 9px}}.empty{{padding:50px 15px;text-align:center;color:var(--muted);background:white;border:1px solid var(--line);border-radius:10px}}.pagination{{display:flex;justify-content:space-between;margin:20px 0 40px}}.page-link{{color:var(--accent);text-decoration:none;font-weight:600}}footer{{border-top:1px solid var(--line);padding:18px;text-align:center;color:var(--muted);font-size:.84rem}}footer a{{color:var(--accent)}}@media(max-width:720px){{form{{grid-template-columns:1fr 1fr}}form input{{grid-column:1/-1}}header{{padding:28px 22px}}main{{margin-top:18px}}}}
-.editions{{display:flex;gap:18px;margin:0 0 12px;padding:0 4px}}.editions a{{color:var(--accent);text-decoration:none;font-weight:600}}.editions a.active{{color:var(--ink);border-bottom:2px solid var(--accent)}}.why{{margin-top:12px;color:var(--muted);font-size:.82rem}}
+.editions{{display:flex;gap:18px;margin:0 0 12px;padding:0 4px}}.editions a{{color:var(--accent);text-decoration:none;font-weight:600}}.editions a.active{{color:var(--ink);border-bottom:2px solid var(--accent)}}.why{{margin-top:12px;color:var(--muted);font-size:.82rem}}.topics{{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}}.topics a{{background:#fff;border:1px solid var(--line);border-radius:999px;padding:7px 12px;text-decoration:none;color:#34569c;font-size:.88rem}}.topics a.active{{background:#2859c5;color:white;border-color:#2859c5}}
 </style></head><body><header><h1>GenAI Intelligence</h1><p>A source-linked briefing on what’s changing across generative AI, open models, research, and developer tools.</p></header>
 <main><div class="stats"><span class="stat"><strong>{total:,}</strong> {"selected briefing stories" if edition == "briefing" else "matching articles"}</span><span class="stat"><strong>{counts["pool_total"]:,}</strong> in library</span><span class="stat"><strong>{counts["sources"]}</strong> sources</span><span class="stat">No AI-generated summaries</span></div>
 <nav class="editions"><a class="{"active" if edition == "briefing" else ""}" href="{briefing_url}">Daily briefing</a><a class="{"active" if edition == "all" else ""}" href="{archive_url}">All articles ({counts["pool_total"]:,})</a></nav>
+<nav class="topics" aria-label="Browse by topic"><a class="{"active" if not category else ""}" href="{all_topics_url}">All topics</a>{"".join(topic_links)}</nav>
 <form action="/" method="get"><input type="hidden" name="edition" value="{edition}"><input type="search" name="q" value="{html.escape(q, quote=True)}" placeholder="Search headlines and summaries" aria-label="Search articles"><select name="source" aria-label="Filter by source">{source_options}</select><select name="category" aria-label="Filter by topic">{category_options}</select><button type="submit">Filter</button></form>
 {"".join(cards) if cards else '<div class="empty">No recent stories match this view. Try the full article archive or adjust the filters.</div>'}
 <nav class="pagination">{pagination}</nav></main><footer>Summaries and links are provided for discovery. Read each story at its <a href="/api/sources">original source</a>.</footer></body></html>'''

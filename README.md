@@ -1,4 +1,4 @@
-# GenAI Intelligence V0.2
+# GenAI Intelligence V0.3
 
 A zero-cost, source-linked GenAI technology newspaper. It collects public RSS/Atom feeds and public GitHub, Hugging Face Hub, and arXiv API results, then selects a compact daily briefing with explainable rules. It does not call an LLM or any paid service.
 
@@ -11,6 +11,8 @@ A zero-cost, source-linked GenAI technology newspaper. It collects public RSS/At
 - A daily briefing of up to 20 items from the last seven days, ranked by freshness, source trust, headline signals, and available community engagement.
 - Duplicate-title and URL suppression plus a three-story-per-source cap to make the briefing more varied. Each selected story shows the rules that helped it qualify.
 - A full archive remains available from the **All articles** view; items are not deleted by curation.
+- Articles are classified individually into the agreed eight radar topics: foundation models, agentic AI, frameworks/tools, RAG/retrieval, benchmarks/evaluation, AI research, inference/infrastructure, and startups/products. The site exposes these as topic navigation; source-wide labels no longer determine every article's topic.
+- Topic assignment currently uses transparent keyword rules over each article's title, abstract/summary, body, and feed tags. Existing database rows are reclassified once on first startup after this update. Items without a strong keyword match fall into AI research so every document stays discoverable.
 - A CLI for listing sources, ingesting, browsing recent articles, and checking database counts, plus a searchable web reader and JSON API.
 - A Dockerfile and Docker Compose configuration for hosting with persistent storage and daily scheduled collection.
 - Tests for source loading, URL normalization, idempotency, and collection failures.
@@ -64,6 +66,6 @@ Each `sources` entry has required `id`, `name`, `type`, and `url` fields. `type`
 
 Collection errors are isolated per source, recorded in `ingestion_runs`, reported in the CLI output, and cause `ingest` to return a nonzero status if any source failed. Re-running a collection updates records by source identity and avoids duplicating them. URL canonicalization removes fragments and common tracking parameters. Similar stories arriving from different sources remain distinct records so their provenance is retained.
 
-## Curation rules and boundaries
+## Topic classification and curation
 
-The database keeps the complete normalized archive. The daily briefing considers items from the last seven days, favors freshness and higher configured source trust, boosts selected high-signal headline terms, uses engagement metadata when available, removes exact and near-duplicate headlines, and caps each source at three stories. The rules and reasons are deterministic and do not generate summaries. `trust_score` and categories are source defaults, not claims that an article has been editorially reviewed. Personalization and generated summaries are not included.
+The database keeps the complete normalized archive. The daily briefing considers items from the last seven days, favors freshness and higher configured source trust, boosts selected high-signal headline terms, uses engagement metadata when available, removes exact and near-duplicate headlines, and caps each source at three stories. Selection rules and topic tags are deterministic and explainable. Topic tagging is article-level and can assign multiple radar topics. It does not yet merge articles into one event or generate a self-contained newspaper story; those are the next intelligence features. `trust_score` is a source default, not a claim that an article has been editorially reviewed.

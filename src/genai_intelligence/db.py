@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
   fetched_count INTEGER NOT NULL DEFAULT 0, inserted_count INTEGER NOT NULL DEFAULT 0,
   error TEXT
 );
+CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 POSTGRES_SCHEMA = """
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
   started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL,
   fetched_count INTEGER NOT NULL DEFAULT 0, inserted_count INTEGER NOT NULL DEFAULT 0, error TEXT
 );
+CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 
@@ -115,6 +117,27 @@ class Repository:
             self.conn.row_factory = sqlite3.Row
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.executescript(SCHEMA)
+        self.conn.commit()
+        self._apply_topic_taxonomy()
+
+    def _apply_topic_taxonomy(self) -> None:
+        """Reclassify the existing library once when the stable topic set changes."""
+        migration = "topic_taxonomy_v1"
+        if self.conn.execute("SELECT 1 FROM app_meta WHERE key=?", (migration,)).fetchone():
+            return
+        from .classification import classify_article
+        rows = self.conn.execute("SELECT id,title,summary,content,categories_json FROM articles").fetchall()
+        for row in rows:
+            try:
+                tags = json.loads(row["categories_json"] or "[]")
+            except (TypeError, ValueError):
+                tags = []
+            categories = classify_article(title=row["title"] or "", summary=row["summary"] or "",
+                                          content=row["content"] or "", tags=tags)
+            self.conn.execute("UPDATE articles SET categories_json=? WHERE id=?",
+                              (json.dumps(categories), row["id"]))
+        self.conn.execute("INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING",
+                          (migration, "complete"))
         self.conn.commit()
 
     def close(self) -> None:

@@ -7,9 +7,10 @@ import json
 import logging
 import os
 import hmac
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse
@@ -30,6 +31,42 @@ def _database_path() -> str:
 
 def _config_path() -> str:
     return os.getenv("GENAI_INTEL_CONFIG", "config/sources.yaml")
+
+
+def _short_brief(generated: str, source_text: str, *, word_limit: int = 72) -> tuple[str, str]:
+    """Return a compact, labeled card brief without implying source text is AI-written."""
+    generated = str(generated or "").strip()
+    value = generated if generated else str(source_text or "")
+    label = "AI brief" if generated else "From the source"
+    value = html.unescape(re.sub(r"<[^>]+>", " ", value or ""))
+    value = re.sub(r"\s+", " ", value).strip()
+    if not value:
+        return "The feed did not include a summary for this story.", "Story details"
+
+    sentences = re.split(r"(?<=[.!?])\s+", value)
+    compact = ""
+    for sentence in sentences:
+        candidate = f"{compact} {sentence}".strip()
+        if len(candidate.split()) > word_limit:
+            break
+        compact = candidate
+        if len(compact.split()) >= 36:
+            break
+    if not compact:
+        compact = " ".join(value.split()[:word_limit])
+    if len(compact.split()) < len(value.split()):
+        compact = compact.rstrip(" ,;:") + "…"
+    return compact, label
+
+
+def _source_label(source_id: object) -> str:
+    return str(source_id or "Source").replace("_", " ").replace("-", " ").title()
+
+
+def _external_url(value: object) -> str:
+    url = str(value or "").strip()
+    parsed = urlsplit(url)
+    return url if parsed.scheme in {"http", "https"} and parsed.netloc else ""
 
 
 def _run_ingestion() -> list[dict]:
@@ -299,10 +336,16 @@ def issue_page(week_id: str) -> str:
     cards = []
     for article, study in articles:
         safe_id = html.escape(article["id"], quote=True)
+        summary, summary_label = _short_brief(study.get("briefing", ""), article.get("summary") or article.get("content") or "")
         evidence = study.get("evidence_sources") or [{"source_id": article["source_id"], "url": article["url"]}]
-        links = " · ".join(f'<a href="{html.escape(str(source.get("url") or "#"), quote=True)}" target="_blank" rel="noopener noreferrer">{html.escape(str(source.get("source_id") or "Source"))}</a>' for source in evidence)
-        cards.append(f'<article><h2>{html.escape(article["title"])}</h2><p>{html.escape(study["briefing"])}</p><h3>Why it matters</h3><p>{html.escape(study["why_it_matters"])}</p><p>Evidence: {links}</p><button class="complete" data-id="{safe_id}" type="button">Open saved quiz + flashcards</button><div class="study" id="study-{safe_id}"></div></article>')
-    return f'<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Week {html.escape(week_id)} · GenAI Intelligence</title><style>body{{font:16px/1.6 system-ui;background:#f5f7fa;color:#172536;margin:0}}main{{max-width:850px;margin:32px auto;padding:0 18px}}article{{background:white;border:1px solid #e2e8f0;border-radius:10px;padding:20px;margin:14px 0}}a{{color:#2859c5}}.study fieldset{{margin:10px 0;padding:12px}}.answer{{color:#176b43}}.error{{color:#a22}}</style></head><body><main><p><a href="/issues">← All saved editions</a></p><h1>Week {html.escape(week_id)}</h1><p>{len(articles)} developments · saved {html.escape(str(issue["generated_at"])[:10])}</p>{"".join(cards)}</main><script src="/notebook.js" defer></script></body></html>'
+        links = " · ".join(f'<a href="{html.escape(_external_url(source.get("url")), quote=True)}" target="_blank" rel="noopener noreferrer">{html.escape(_source_label(source.get("source_id")))}</a>' for source in evidence if _external_url(source.get("url")))
+        original_url = _external_url(article.get("url"))
+        categories = json.loads(article.get("categories_json") or "[]")
+        chips = "".join(f'<span class="tag">{html.escape(CATEGORY_LABELS.get(c, c.replace("_", " ").title()))}</span>' for c in categories[:3])
+        original_link = f'<a class="original" href="{html.escape(original_url, quote=True)}" target="_blank" rel="noopener noreferrer">Read original <span aria-hidden="true">↗</span></a>' if original_url else ""
+        evidence_note = f'<p class="evidence">Coverage: {links}</p>' if links else ""
+        cards.append(f'<article class="card"><div class="tags">{chips}</div><h2>{html.escape(article["title"])}</h2><p class="brief-label">{html.escape(summary_label)}</p><p class="brief">{html.escape(summary)}</p><h3>Why it matters</h3><p>{html.escape(study["why_it_matters"])}</p>{evidence_note}<div class="actions">{original_link}<button class="complete" data-id="{safe_id}" type="button">Open quiz + flashcards</button></div><div class="study" id="study-{safe_id}"></div></article>')
+    return f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Week {html.escape(week_id)} · GenAI Intelligence</title><style>body{{font:16px/1.6 system-ui;background:#f4f6f8;color:#172536;margin:0}}main{{max-width:760px;margin:32px auto;padding:0 18px}}.card{{background:white;border:1px solid #e2e8f0;border-radius:14px;padding:22px;margin:18px 0;box-shadow:0 5px 18px #1328420a}}h2{{font:600 1.45rem/1.28 Georgia,serif;margin:14px 0 8px}}h3{{font-size:.98rem;margin:18px 0 4px}}.brief-label,.evidence{{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:#64748b}}.brief{{font-size:1.08rem;color:#26384d}}.tags{{display:flex;gap:6px;flex-wrap:wrap}}.tag{{font-size:.76rem;background:#eef3ff;color:#34569c;border-radius:99px;padding:3px 9px}}.actions{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px}}a{{color:#2859c5}}.original{{display:inline-block;background:#2859c5;color:white;text-decoration:none;border-radius:7px;padding:9px 13px;font-weight:650}}button{{font:inherit;border:1px solid #d7deea;border-radius:7px;padding:9px 13px;background:white;color:#23416b;font-weight:600;cursor:pointer}}.study fieldset{{margin:10px 0;padding:12px}}.answer{{color:#176b43}}.error{{color:#a22}}</style></head><body><main><p><a href="/issues">← All saved editions</a></p><h1>Week {html.escape(week_id)}</h1><p>{len(articles)} developments · saved {html.escape(str(issue["generated_at"])[:10])}</p>{"".join(cards)}</main><script src="/notebook.js" defer></script></body></html>'
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -330,20 +373,20 @@ def home(request: Request, q: str = "", source: str = "", category: str = "",
             except (ValueError, AttributeError):
                 date_label = published[:10]
         weekly_analysis = item.get("weekly_analysis") or {}
-        summary = weekly_analysis.get("briefing") or item.get("summary") or item.get("content") or "No summary was supplied by the source. Open the source for the full story; mark it read afterward to save a study kit."
+        summary, summary_label = _short_brief(weekly_analysis.get("briefing", ""), item.get("summary") or item.get("content") or "")
         chips = "".join(f'<span class="tag">{html.escape(CATEGORY_LABELS.get(c, c.replace("_", " ").title()))}</span>' for c in item["categories"][:4])
-        why = " · ".join(item.get("selection_reasons", []))
-        editorial_note = f'<div class="why">Why it made the briefing: {html.escape(why)}</div>' if why and edition == "briefing" else ""
+        editorial_note = ""
         if weekly_analysis.get("why_it_matters"):
-            editorial_note += f'<div class="why"><strong>Why it matters:</strong> {html.escape(weekly_analysis["why_it_matters"])}</div>'
+            editorial_note += f'<div class="why"><strong>Why it matters</strong><p>{html.escape(weekly_analysis["why_it_matters"])}</p></div>'
         evidence_sources = weekly_analysis.get("evidence_sources") or ([{"source_id": item["source_id"], "url": item["url"]}] + item.get("related_sources", []))
-        if len(evidence_sources) > 1 or weekly_analysis.get("evidence_sources"):
-            evidence_links = " · ".join(f'<a href="{html.escape(str(source.get("url") or "#"), quote=True)}" target="_blank" rel="noopener noreferrer">{html.escape(str(source.get("source_id") or "Source"))}</a>' for source in evidence_sources)
-            editorial_note += f'<div class="why">Coverage: {evidence_links}</div>'
+        evidence_links = " · ".join(f'<a href="{html.escape(_external_url(source.get("url")), quote=True)}" target="_blank" rel="noopener noreferrer">{html.escape(_source_label(source.get("source_id")))}</a>' for source in evidence_sources if _external_url(source.get("url")))
+        if len(evidence_sources) > 1 and evidence_links:
+            editorial_note += f'<div class="evidence">Coverage: {evidence_links}</div>'
         safe_id = html.escape(item["id"], quote=True)
-        cards.append(f'''<article class="card" data-article-id="{safe_id}"><div class="meta"><span>{html.escape(item["source_id"].replace("_", " ").title())}</span><span>{html.escape(date_label)}</span></div>
-<h2><a href="{html.escape(item["url"], quote=True)}" target="_blank" rel="noopener noreferrer">{html.escape(item["title"])}</a></h2>
-<p>{html.escape(summary[:600])}{"…" if len(summary) > 600 else ""}</p><div class="tags">{chips}</div>{editorial_note}<button class="complete" type="button" data-id="{safe_id}">Mark read &amp; create study kit</button><div class="study" id="study-{safe_id}"></div></article>''')
+        original_url = _external_url(item.get("url"))
+        original_link = f'<a class="original" href="{html.escape(original_url, quote=True)}" target="_blank" rel="noopener noreferrer">Read original <span aria-hidden="true">↗</span></a>' if original_url else ""
+        cards.append(f'''<article class="card" data-article-id="{safe_id}"><div class="meta"><span>{html.escape(_source_label(item["source_id"]))}</span><span>{html.escape(date_label)}</span></div>
+<div class="tags">{chips}</div><h2>{html.escape(item["title"])}</h2><p class="brief-label">{html.escape(summary_label)}</p><p class="brief">{html.escape(summary)}</p>{editorial_note}<div class="actions">{original_link}<button class="complete" type="button" data-id="{safe_id}">Mark read &amp; create study kit</button></div><div class="study" id="study-{safe_id}"></div></article>''')
     pages = max(1, (total + limit - 1) // limit)
     def page_link(n: int, label: str) -> str:
         params = {k: v for k, v in {"q": q, "source": source, "category": category, "edition": edition, "page": str(n)}.items() if v}
@@ -360,11 +403,11 @@ def home(request: Request, q: str = "", source: str = "", category: str = "",
         label = html.escape(CATEGORY_LABELS.get(topic, topic.replace("_", " ").title()))
         topic_links.append(f'<a class="{active}" href="/?{urlencode(topic_params)}">{label}</a>')
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="A weekly AI notebook with categorized developments, saved learning notes, quizzes, and flashcards."><title>GenAI Intelligence</title>
+<meta name="description" content="A concise AI technology newspaper with original-source links and a personal learning notebook."><title>GenAI Intelligence</title>
 <style>
 :root{{--ink:#172536;--muted:#64748b;--paper:#f5f7fa;--line:#e2e8f0;--accent:#2859c5}}*{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:16px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}header{{background:#10253d;color:white;padding:34px max(calc((100vw - 1000px)/2),24px) 30px}}header h1{{font-family:Georgia,serif;font-size:clamp(2rem,5vw,3.25rem);line-height:1.05;margin:0 0 10px;letter-spacing:-.04em}}header p{{margin:0;color:#c3d2e5;max-width:620px}}main{{max-width:1000px;margin:25px auto;padding:0 20px}}.stats{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}.stat{{background:white;border:1px solid var(--line);border-radius:8px;padding:9px 13px;color:var(--muted);font-size:.9rem}}.stat strong{{color:var(--ink)}}form{{display:grid;grid-template-columns:1fr 180px 180px auto;gap:9px;background:white;border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:18px}}input,select,button{{font:inherit;border:1px solid var(--line);border-radius:7px;padding:10px 12px;background:white;color:var(--ink)}}button{{background:var(--accent);color:white;border-color:var(--accent);font-weight:600;cursor:pointer}}.card{{background:white;border:1px solid var(--line);border-radius:10px;padding:20px 22px;margin:12px 0;box-shadow:0 2px 8px #16263b08}}.meta{{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.05em}}h2{{font-family:Georgia,serif;font-size:1.4rem;line-height:1.25;margin:10px 0}}h2 a{{color:var(--ink);text-decoration:none}}h2 a:hover{{color:var(--accent)}}.card p{{color:#475569;margin:0 0 12px}}.tags{{display:flex;gap:6px;flex-wrap:wrap}}.tag{{font-size:.76rem;text-transform:capitalize;background:#eef3ff;color:#34569c;border-radius:99px;padding:3px 9px}}.empty{{padding:50px 15px;text-align:center;color:var(--muted);background:white;border:1px solid var(--line);border-radius:10px}}.pagination{{display:flex;justify-content:space-between;margin:20px 0 40px}}.page-link{{color:var(--accent);text-decoration:none;font-weight:600}}footer{{border-top:1px solid var(--line);padding:18px;text-align:center;color:var(--muted);font-size:.84rem}}footer a{{color:var(--accent)}}@media(max-width:720px){{form{{grid-template-columns:1fr 1fr}}form input{{grid-column:1/-1}}header{{padding:28px 22px}}main{{margin-top:18px}}}}
-.editions{{display:flex;gap:18px;margin:0 0 12px;padding:0 4px}}.editions a{{color:var(--accent);text-decoration:none;font-weight:600}}.editions a.active{{color:var(--ink);border-bottom:2px solid var(--accent)}}.why{{margin-top:12px;color:var(--muted);font-size:.82rem}}.topics{{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}}.topics a{{background:#fff;border:1px solid var(--line);border-radius:999px;padding:7px 12px;text-decoration:none;color:#34569c;font-size:.88rem}}.topics a.active{{background:#2859c5;color:white;border-color:#2859c5}}.complete{{margin-top:14px}}.study{{margin-top:14px}}.study h3{{margin-bottom:4px}}.study details{{border-top:1px solid var(--line);padding:8px 0}}.study summary{{cursor:pointer;font-weight:600}}.study .answer{{color:#176b43;font-weight:600}}.study .error{{color:#a22}}.study fieldset{{border:1px solid var(--line);border-radius:8px;margin:10px 0;padding:12px}}.study fieldset label{{display:inline-block;padding:4px}}
-</style></head><body><header><h1>GenAI Intelligence</h1><p>Your weekly AI notebook: important developments, saved learning notes, quizzes, and flashcards.</p></header>
+.editions{{display:flex;gap:18px;margin:0 0 12px;padding:0 4px}}.editions a{{color:var(--accent);text-decoration:none;font-weight:600}}.editions a.active{{color:var(--ink);border-bottom:2px solid var(--accent)}}.why{{margin:15px 0 0;padding:13px 15px;border-left:3px solid #a8bce9;background:#f7f9fd;border-radius:0 8px 8px 0;color:#33445a;font-size:.93rem}}.why p{{margin:4px 0 0;color:#475569}}.topics{{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}}.topics a{{background:#fff;border:1px solid var(--line);border-radius:999px;padding:7px 12px;text-decoration:none;color:#34569c;font-size:.88rem}}.topics a.active{{background:#2859c5;color:white;border-color:#2859c5}}.complete{{margin-top:14px}}.study{{margin-top:14px}}.study h3{{margin-bottom:4px}}.study details{{border-top:1px solid var(--line);padding:8px 0}}.study summary{{cursor:pointer;font-weight:600}}.study .answer{{color:#176b43;font-weight:600}}.study .error{{color:#a22}}.study fieldset{{border:1px solid var(--line);border-radius:8px;margin:10px 0;padding:12px}}.study fieldset label{{display:inline-block;padding:4px}}.card{{border-radius:14px;padding:22px 24px;margin:16px auto;max-width:820px;box-shadow:0 5px 18px #16263b0a}}.meta{{text-transform:none;letter-spacing:0}}.card h2{{font:600 clamp(1.35rem,3vw,1.7rem)/1.25 Georgia,serif;letter-spacing:-.015em;margin:13px 0 8px}}.brief-label{{font-size:.75rem!important;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)!important;margin:12px 0 3px!important}}.card p.brief{{font-size:1.08rem;line-height:1.58;color:#26384d;margin:0 0 14px}}.evidence{{margin-top:13px;color:var(--muted);font-size:.82rem}}.evidence a{{color:#34569c;text-decoration:none}}.actions{{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:16px}}.original{{display:inline-flex;align-items:center;gap:6px;background:var(--accent);color:white;text-decoration:none;border-radius:7px;padding:9px 13px;font-weight:650}}.original:hover{{background:#1d459f}}.actions button.complete{{margin:0;background:white;color:#23416b;border-color:#cbd5e1;font-weight:600}}.actions button.complete:hover{{background:#f4f7fb}}.study{{border-top:1px solid var(--line);padding-top:12px}}@media(max-width:600px){{.card{{padding:18px}}.actions{{align-items:stretch}}.actions>*{{text-align:center;justify-content:center;flex:1 1 100%}}}}
+</style></head><body><header><h1>GenAI Intelligence</h1><p>A quick, useful read on what changed in AI. Open the original story when you want more detail, then save what you learn in your notebook.</p></header>
 <main><div class="stats"><span class="stat"><strong>{total:,}</strong> {"stories from the last 7 days" if edition == "briefing" else "matching articles"}</span><span class="stat"><strong>{counts["pool_total"]:,}</strong> in library</span><span class="stat"><strong>{counts["sources"]}</strong> sources</span></div>
 <nav class="editions"><a class="{"active" if edition == "briefing" else ""}" href="{briefing_url}">This week</a><a class="{"active" if edition == "all" else ""}" href="{archive_url}">All articles ({counts["pool_total"]:,})</a><a href="/issues">Saved editions</a></nav>
 <nav class="topics" aria-label="Browse by topic"><a class="{"active" if not category else ""}" href="{all_topics_url}">All topics</a>{"".join(topic_links)}</nav>

@@ -8,6 +8,8 @@ import re
 
 import httpx
 
+from .telemetry import track_external_call
+
 logger = logging.getLogger("genai_intelligence.analysis")
 ANALYSIS_VERSION = 1
 TIMEOUT = httpx.Timeout(100.0, connect=10.0)
@@ -99,14 +101,17 @@ def _groq(prompt: str) -> tuple[dict, str]:
     if not key:
         raise RuntimeError("GROQ_API_KEY is not configured")
     model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
-    response = httpx.post("https://api.groq.com/openai/v1/chat/completions", timeout=TIMEOUT,
-        headers={"Authorization": f"Bearer {key}"},
-        json={"model": model, "temperature": 0.2, "max_tokens": 3800,
-              "response_format": {"type": "json_object"},
-              "messages": [{"role": "user", "content": prompt}]})
-    response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"]
-    return _validate(json.loads(content)), model
+    with track_external_call(service="groq", operation="long_form_analysis", model=model,
+                             endpoint="api.groq.com/openai/v1/chat/completions") as trace:
+        response = httpx.post("https://api.groq.com/openai/v1/chat/completions", timeout=TIMEOUT,
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": model, "temperature": 0.2, "max_tokens": 3800,
+                  "response_format": {"type": "json_object"},
+                  "messages": [{"role": "user", "content": prompt}]})
+        trace["http_status"] = response.status_code
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        return _validate(json.loads(content)), model
 
 
 def _gemini(prompt: str) -> tuple[dict, str]:
@@ -114,14 +119,17 @@ def _gemini(prompt: str) -> tuple[dict, str]:
     if not key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
     model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-    response = httpx.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        timeout=TIMEOUT, headers={"x-goog-api-key": key},
-        json={"contents": [{"parts": [{"text": prompt}]}],
-              "generationConfig": {"temperature": 0.2, "maxOutputTokens": 3800,
-                                   "responseMimeType": "application/json"}})
-    response.raise_for_status()
-    content = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-    return _validate(json.loads(content)), model
+    with track_external_call(service="gemini", operation="long_form_analysis", model=model,
+                             endpoint="generativelanguage.googleapis.com/generateContent") as trace:
+        response = httpx.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            timeout=TIMEOUT, headers={"x-goog-api-key": key},
+            json={"contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"temperature": 0.2, "maxOutputTokens": 3800,
+                                       "responseMimeType": "application/json"}})
+        trace["http_status"] = response.status_code
+        response.raise_for_status()
+        content = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return _validate(json.loads(content)), model
 
 
 def generate_analysis(article: dict, related: list[dict] | None = None) -> tuple[dict, str, str]:

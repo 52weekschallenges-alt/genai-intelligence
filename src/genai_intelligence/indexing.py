@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
 from .db import Repository
+from .telemetry import track_external_call
 
 logger = logging.getLogger("genai_intelligence.indexing")
 EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")
@@ -178,14 +179,17 @@ def _embed(chunks: list[str], title: str) -> list[list[float]]:
         "content": {"parts": [{"text": f"Title: {title}\n\nDocument passage: {chunk}"}]},
         "outputDimensionality": EMBEDDING_DIMENSIONS,
     } for chunk in chunks]
-    response = httpx.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents",
-        timeout=httpx.Timeout(45.0, connect=8.0), headers={"x-goog-api-key": key}, json={"requests": requests})
-    response.raise_for_status()
-    values = [item.get("values", []) for item in response.json().get("embeddings", [])]
-    if len(values) != len(chunks) or any(len(vector) != EMBEDDING_DIMENSIONS for vector in values):
-        raise ValueError("Embedding service returned vectors with an unexpected count or dimension")
-    return [[float(value) for value in vector] for vector in values]
+    with track_external_call(service="gemini", operation="document_embeddings", model=model,
+                             endpoint="generativelanguage.googleapis.com/batchEmbedContents") as trace:
+        response = httpx.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents",
+            timeout=httpx.Timeout(45.0, connect=8.0), headers={"x-goog-api-key": key}, json={"requests": requests})
+        trace["http_status"] = response.status_code
+        response.raise_for_status()
+        values = [item.get("values", []) for item in response.json().get("embeddings", [])]
+        if len(values) != len(chunks) or any(len(vector) != EMBEDDING_DIMENSIONS for vector in values):
+            raise ValueError("Embedding service returned vectors with an unexpected count or dimension")
+        return [[float(value) for value in vector] for vector in values]
 
 
 def _fresh(existing: dict | None, fingerprint: str, *, now: datetime, model: str) -> bool:

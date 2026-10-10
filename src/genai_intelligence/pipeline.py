@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import time
 from typing import Callable
 
 from .collectors import collect
@@ -13,6 +14,7 @@ from .sources import Source
 def ingest_source(repo: Repository, source: Source, collector: Callable[[Source], list[Article]] = collect) -> dict:
     repo.upsert_source(source)
     started = datetime.now(timezone.utc).isoformat()
+    timer = time.monotonic()
     try:
         items = collector(source)
         inserted = 0
@@ -29,12 +31,16 @@ def ingest_source(repo: Repository, source: Source, collector: Callable[[Source]
             if not same_id:
                 inserted += 1
         finished = datetime.now(timezone.utc).isoformat()
-        repo.record_run(source.id, started, finished, "success", len(items), inserted)
-        return {"source_id": source.id, "status": "success", "fetched": len(items), "inserted": inserted}
+        latency_ms = round((time.monotonic() - timer) * 1000)
+        repo.record_run(source.id, started, finished, "success", len(items), inserted, latency_ms=latency_ms)
+        return {"source_id": source.id, "status": "success", "fetched": len(items), "inserted": inserted, "latency_ms": latency_ms}
     except Exception as exc:
         finished = datetime.now(timezone.utc).isoformat()
-        repo.record_run(source.id, started, finished, "error", 0, 0, f"{type(exc).__name__}: {exc}")
-        return {"source_id": source.id, "status": "error", "fetched": 0, "inserted": 0, "error": f"{type(exc).__name__}: {exc}"}
+        latency_ms = round((time.monotonic() - timer) * 1000)
+        repo.record_run(source.id, started, finished, "error", 0, 0,
+                        f"{type(exc).__name__}: {exc}", latency_ms=latency_ms)
+        return {"source_id": source.id, "status": "error", "fetched": 0, "inserted": 0,
+                "latency_ms": latency_ms, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def ingest_all(repo: Repository, sources: list[Source], collector: Callable[[Source], list[Article]] = collect) -> list[dict]:

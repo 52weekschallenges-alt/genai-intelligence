@@ -165,18 +165,25 @@ def _probe_provider(service: str, model: str, key: str) -> tuple[str, int, str]:
     import httpx
 
     started = time.monotonic()
-    if service == "groq_chat":
-        response = httpx.get("https://api.groq.com/openai/v1/models", timeout=5.0,
-                             headers={"Authorization": f"Bearer {key}"})
-        response.raise_for_status()
-        available = any(item.get("id") == model and item.get("active", True)
-                        for item in response.json().get("data", []))
-        if not available:
-            return "model_unavailable", round((time.monotonic() - started) * 1000), f"API reachable; configured model {model} is not listed"
-    else:
-        endpoint = "https://generativelanguage.googleapis.com/v1beta/models/" + quote(model, safe="")
-        response = httpx.get(endpoint, timeout=5.0, headers={"x-goog-api-key": key})
-        response.raise_for_status()
+    from .telemetry import track_external_call
+    endpoint = ("api.groq.com/openai/v1/models" if service == "groq_chat"
+                else "generativelanguage.googleapis.com/v1beta/models/" + quote(model, safe=""))
+    with track_external_call(service=service, operation="metadata_health_check", model=model,
+                             endpoint=endpoint) as trace:
+        if service == "groq_chat":
+            response = httpx.get("https://api.groq.com/openai/v1/models", timeout=5.0,
+                                 headers={"Authorization": f"Bearer {key}"})
+            trace["http_status"] = response.status_code
+            response.raise_for_status()
+            available = any(item.get("id") == model and item.get("active", True)
+                            for item in response.json().get("data", []))
+            if not available:
+                return "model_unavailable", round((time.monotonic() - started) * 1000), f"API reachable; configured model {model} is not listed"
+        else:
+            response = httpx.get("https://generativelanguage.googleapis.com/v1beta/models/" + quote(model, safe=""),
+                                 timeout=5.0, headers={"x-goog-api-key": key})
+            trace["http_status"] = response.status_code
+            response.raise_for_status()
     return "reachable", round((time.monotonic() - started) * 1000), f"Configured model {model} is available"
 
 
@@ -267,6 +274,38 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="GenAI Intelligence", description="A weekly GenAI notebook with saved learning tools.", version="0.5.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def request_telemetry(request: Request, call_next):
+    """Persist route outcome/latency without recording query strings or user data."""
+    import time
+
+    request_id = str(uuid.uuid4())
+    started = time.monotonic()
+    status_code = 500
+    error_type = None
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception as exc:
+        error_type = type(exc).__name__
+        raise
+    finally:
+        try:
+            repo = Repository(_database_path())
+            try:
+                repo.record_internal_http_request(
+                    request_id, created_at=datetime.now(timezone.utc).isoformat(),
+                    method=request.method, path=request.url.path, status_code=status_code,
+                    latency_ms=round((time.monotonic() - started) * 1000), error_type=error_type,
+                )
+            finally:
+                repo.close()
+        except Exception as exc:
+            logger.warning("Could not persist route telemetry (%s)", type(exc).__name__)
 logger = logging.getLogger("genai_intelligence.web")
 
 
@@ -370,6 +409,8 @@ def _articles(q: str, source: str, category: str, limit: int, offset: int,
         if edition == "briefing":
             week_id = datetime.now(timezone.utc).strftime("%G-W%V")
             weekly_issue = repo.get_weekly_edition(week_id)
+            if not weekly_issue or weekly_issue["status"] != "published":
+                weekly_issue = repo.conn.execute("SELECT * FROM weekly_editions WHERE status='published' ORDER BY week_id DESC LIMIT 1").fetchone()
         issue_ids = json.loads(weekly_issue["article_ids_json"]) if weekly_issue else []
         if issue_ids:
             clauses.append("id IN (" + ",".join("?" for _ in issue_ids) + ")")
@@ -403,7 +444,10 @@ def _articles(q: str, source: str, category: str, limit: int, offset: int,
             data.append(item)
         if edition == "briefing":
             total = len(data)
-        if edition != "all" and not issue_ids:
+        if edition == "briefing" and not issue_ids:
+            data = []
+            total = 0
+        elif edition != "all" and not issue_ids:
             data = curate_articles(data, limit=max(BRIEFING_SIZE, limit + offset))
             total = len(data)
             data = data[offset:offset + limit]
@@ -438,7 +482,7 @@ def status_api() -> dict:
             "published_editions": int(repo.conn.execute("SELECT COUNT(*) AS total FROM weekly_editions WHERE status='published'").fetchone()["total"]),
         }
         source_rows = repo.conn.execute("""SELECT s.id,s.name,s.type,s.url,r.started_at AS checked_at,
-          r.status AS last_status,r.fetched_count,r.inserted_count,r.error
+          r.status AS last_status,r.fetched_count,r.inserted_count,r.error,r.latency_ms
           FROM sources s LEFT JOIN ingestion_runs r ON r.id=(
             SELECT MAX(id) FROM ingestion_runs WHERE source_id=s.id
           ) WHERE s.enabled=1 ORDER BY s.name""").fetchall()
@@ -472,6 +516,9 @@ def status_api() -> dict:
         last_analysis = repo.conn.execute("SELECT provider,model,created_at FROM article_analyses ORDER BY created_at DESC LIMIT 1").fetchone()
         last_study = repo.conn.execute("SELECT provider,model,created_at FROM article_studies ORDER BY created_at DESC LIMIT 1").fetchone()
         last_embedding = repo.conn.execute("SELECT status,indexed_at,embedding_model,error FROM article_documents ORDER BY indexed_at DESC LIMIT 1").fetchone()
+        internal_requests = [dict(row) for row in repo.recent_internal_requests(100)]
+        external_requests = [dict(row) for row in repo.recent_external_requests(100)
+                             if row["operation"] != "metadata_health_check"]
         return {
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "database": {"status": "connected", "backend": repo.backend},
@@ -484,6 +531,8 @@ def status_api() -> dict:
             "last_successful_analysis": dict(last_analysis) if last_analysis else None,
             "last_successful_study_kit": dict(last_study) if last_study else None,
             "last_embedding_attempt": dict(last_embedding) if last_embedding else None,
+            "internal_requests": internal_requests,
+            "external_requests": external_requests,
             "counts": counts,
             "documents_by_status": {row["status"]: int(row["total"]) for row in documents},
             "current_edition": dict(edition) if edition else None,
@@ -495,14 +544,15 @@ def status_api() -> dict:
                 "id": row["id"], "name": row["name"], "type": row["type"], "url": row["url"],
                 "checked_at": row["checked_at"], "last_status": row["last_status"],
                 "fetched": row["fetched_count"], "inserted": row["inserted_count"], "error": row["error"],
+                "latency_ms": row["latency_ms"],
             } for row in source_rows],
             "internal_endpoints": [
                 {"path": "/", "purpose": "Reader"}, {"path": "/health", "purpose": "App health"},
                 {"path": "/api/status", "purpose": "This dashboard and database status"},
                 {"path": "/api/articles", "purpose": "Article API"}, {"path": "/api/sources", "purpose": "Source registry API"},
-                {"path": "/api/cron/collect", "purpose": "Scheduled collector · protected"},
-                {"path": "/api/cron/index", "purpose": "Scheduled indexer · protected"},
-                {"path": "/api/cron/edition", "purpose": "Scheduled edition writer · protected"},
+                {"path": "/api/cron/collect", "purpose": "Backend collector · protected"},
+                {"path": "/api/cron/index", "purpose": "Backend indexer · protected"},
+                {"path": "/api/cron/edition", "purpose": "Backend edition writer · protected"},
             ],
         }
     finally:
@@ -573,11 +623,25 @@ def status_page() -> str:
             state = f"stale · {state}"
         css = "warn" if stale else "good" if state == "success" else "bad" if state == "error" else "muted"
         checked = stamp(source["checked_at"])
-        counts = f'{source["fetched"]} fetched · {source["inserted"]} new' if source["fetched"] is not None else "—"
+        counts = f'{source["fetched"]} fetched · {source["inserted"]} new · {source["latency_ms"] if source["latency_ms"] is not None else "—"} ms' if source["fetched"] is not None else "—"
         error = f'<br><span class="error">{esc(source["error"])}</span>' if source.get("error") else ""
         source_rows.append(f'<tr><td><a href="{esc(source["url"])}" target="_blank" rel="noopener noreferrer">{esc(source["name"])}</a><small>{esc(source["type"])} · {esc(source["url"])}</small></td><td><span class="pill {css}">{esc(state)}</span>{error}</td><td>{checked}</td><td>{counts}</td></tr>')
 
-    endpoint_rows = "".join(f'<tr><td><code>{esc(endpoint["path"])}</code></td><td>{esc(endpoint["purpose"])}</td><td><span class="pill good">registered</span></td></tr>' for endpoint in snapshot["internal_endpoints"])
+    latest_route = {}
+    route_counts = {}
+    for request_log in snapshot["internal_requests"]:
+        latest_route.setdefault(request_log["path"], request_log)
+        route_counts[request_log["path"]] = route_counts.get(request_log["path"], 0) + 1
+    endpoint_rows = "".join(
+        f'<tr><td><code>{esc(endpoint["path"])}</code></td><td>{esc(endpoint["purpose"])}</td>' +
+        (f'<td><span class="pill {"good" if latest_route[endpoint["path"]]["status_code"] < 400 else "bad"}">{latest_route[endpoint["path"]]["status_code"]} · {latest_route[endpoint["path"]]["latency_ms"]} ms</span><small>{route_counts.get(endpoint["path"], 0)} requests in last 30 days</small></td>'
+         if endpoint["path"] in latest_route else '<td><span class="pill muted">not called yet</span></td>') + '</tr>'
+        for endpoint in snapshot["internal_endpoints"])
+    external_rows = "".join(
+        f'<tr><td>{esc(item["service"])}<small>{esc(item["operation"])} · {esc(item["model"])}</small></td>'
+        f'<td><span class="pill {"good" if item["outcome"] == "success" else "bad"}">{esc(item["outcome"])} · {esc(item["http_status"] or "no response")}</span>'
+        f'<small>{esc(item["error_type"] or "")}</small></td><td>{esc(item["latency_ms"])} ms</td><td>{stamp(item["created_at"])}</td></tr>'
+        for item in snapshot["external_requests"])
     sources_html = "".join(source_rows) or '<tr><td colspan="4">No sources are registered yet.</td></tr>'
     provider_rows = []
     for provider in snapshot["providers"]:
@@ -631,7 +695,8 @@ def status_page() -> str:
 <h2>Scheduled pipeline</h2><div class="grid">{"".join(phase_cards)}</div>
 <section class="panel"><h2>External feeds and APIs</h2><p>These show the outcome of the latest scheduled collection; opening a row visits that source.</p><div class="scroll"><table><thead><tr><th>Source endpoint</th><th>Last result</th><th>Last checked</th><th>Collection</th></tr></thead><tbody>{sources_html}</tbody></table></div></section>
 <section class="panel"><h2>LLM and embedding endpoint health</h2><p>Checks call provider model-metadata endpoints every 15 minutes at most. They verify the key and configured model can be reached; they do not generate text or embeddings or consume model tokens.</p><div class="scroll"><table><thead><tr><th>Provider/model</th><th>Reachability</th><th>Last checked</th><th>Response</th></tr></thead><tbody>{providers_html}</tbody></table></div><h3>Last successful real work</h3><p>Embedding: {esc(embedding_status)}{esc(embedding_error)}</p><p>Long-form analysis: {esc(analysis_status)}</p><p>Study kit: {esc(study_status)}</p></section>
-<section class="panel"><h2>App endpoints</h2><div class="scroll"><table><thead><tr><th>Route</th><th>Purpose</th><th>Status</th></tr></thead><tbody>{endpoint_rows}</tbody></table></div><p>Protected cron routes are called by Vercel on schedule. Their run outcomes appear above; secret values are never shown.</p></section>
+<section class="panel"><h2>Actual model and embedding requests</h2><p>These are real generation and embedding calls, with result and response time. Prompts, credentials, and response bodies are not stored.</p><div class="scroll"><table><thead><tr><th>Provider / operation</th><th>Result</th><th>Time</th><th>When</th></tr></thead><tbody>{external_rows or '<tr><td colspan="4">No real model or embedding request has been made yet.</td></tr>'}</tbody></table></div></section>
+<section class="panel"><h2>App and backend request log</h2><p>Last {len(snapshot["internal_requests"])} requests (up to 30 days retained). Route, HTTP result, latency, and error type are logged; query strings, IP addresses, and request contents are excluded.</p><div class="scroll"><table><thead><tr><th>Request</th><th>Result</th><th>Time</th><th>When</th></tr></thead><tbody>{''.join(f'<tr><td><code>{esc(item["method"])} {esc(item["path"])}</code></td><td><span class="pill {"good" if item["status_code"] < 400 else "bad"}">{item["status_code"]}</span><small>{esc(item["error_type"] or "")}</small></td><td>{item["latency_ms"]} ms</td><td>{stamp(item["created_at"])}</td></tr>' for item in snapshot["internal_requests"]) or '<tr><td colspan="4">No requests logged yet.</td></tr>'}</tbody></table></div></section>
 <section class="panel"><h2>Configuration checks</h2><p>Database connection: <span class="pill good">Connected</span></p><p>Scheduled-job secret: <span class="pill {"good" if snapshot["configuration"]["cron_secret_configured"] else "bad"}">{"configured" if snapshot["configuration"]["cron_secret_configured"] else "missing"}</span></p><p>Embedding key: <span class="pill {"good" if snapshot["configuration"]["embedding_key_configured"] else "bad"}">{"configured" if snapshot["configuration"]["embedding_key_configured"] else "missing"}</span></p><p>Analysis/study provider: <span class="pill {"good" if snapshot["configuration"]["study_and_analysis_provider_configured"] else "bad"}">{"configured" if snapshot["configuration"]["study_and_analysis_provider_configured"] else "missing"}</span></p></section>
 <p class="muted">This dashboard reports recorded checks and configuration presence; it does not make extra paid monitoring or model calls.</p></main></body></html>'''
 
@@ -646,6 +711,14 @@ def articles_api(q: str = "", source: str = "", category: str = "", edition: str
                  limit: int = Query(BRIEFING_SIZE, ge=1, le=100), offset: int = Query(0, ge=0)) -> dict:
     if edition not in {"briefing", "all"}:
         edition = "briefing"
+    repo = Repository(_database_path())
+    try:
+        has_published_issue = bool(repo.conn.execute("SELECT 1 FROM weekly_editions WHERE status='published' LIMIT 1").fetchone())
+    finally:
+        repo.close()
+    if not has_published_issue:
+        return {"items": [], "total": 0, "pool_total": 0, "edition": "preparing", "ready": False,
+                "message": "The first complete weekly edition has not been published yet."}
     data, total, counts = _articles(q, source, category, limit, offset, edition)
     return {"items": data, "total": total, "pool_total": counts["pool_total"], "edition": edition,
             "limit": limit, "offset": offset}
@@ -722,6 +795,13 @@ def issue_page(week_id: str) -> str:
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request, q: str = "", source: str = "", category: str = "",
          edition: str = "briefing", page: int = Query(1, ge=1)) -> str:
+    repo = Repository(_database_path())
+    try:
+        has_published_issue = bool(repo.conn.execute("SELECT 1 FROM weekly_editions WHERE status='published' LIMIT 1").fetchone())
+    finally:
+        repo.close()
+    if not has_published_issue:
+        return '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60"><title>Preparing first edition · GenAI Intelligence</title><style>body{font:16px/1.6 system-ui,sans-serif;background:#f4f6f8;color:#172536;margin:0}main{max-width:720px;margin:12vh auto;padding:28px}article{background:white;border:1px solid #e2e8f0;border-radius:14px;padding:30px}a{color:#2859c5;font-weight:650}</style></head><body><main><article><h1>Preparing the first complete edition</h1><p>The backend is collecting sources, indexing full documents, and preparing the first source-grounded weekly reads. The newspaper will appear here after the first complete edition is saved.</p><p><a href="/status">View live pipeline status →</a></p><p>This page refreshes automatically.</p></article></main></body></html>'''
     if edition not in {"briefing", "all"}:
         edition = "briefing"
     limit = 20

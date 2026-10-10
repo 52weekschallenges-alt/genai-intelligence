@@ -188,32 +188,19 @@ async def scheduled_edition(request: Request):
     return await asyncio.to_thread(_run_weekly_edition)
 
 
-def _require_notebook_access(request: Request) -> None:
-    expected = os.getenv("NOTEBOOK_ACCESS_TOKEN", "").strip()
-    supplied = request.headers.get("authorization", "")
-    if not expected:
-        raise HTTPException(status_code=503, detail="Set NOTEBOOK_ACCESS_TOKEN in the hosting environment to enable your private notebook.")
-    if not hmac.compare_digest(supplied, f"Bearer {expected}"):
-        raise HTTPException(status_code=401, detail="Enter your notebook access token to continue.")
-
-
-@app.get("/api/notebook/{article_id}")
-def notebook_item(article_id: str, request: Request) -> dict:
-    _require_notebook_access(request)
+@app.get("/api/study/{article_id}")
+def study_item(article_id: str) -> dict:
     repo = Repository(_database_path())
     try:
-        progress = repo.conn.execute("SELECT completed_at FROM reading_progress WHERE article_id=?", (article_id,)).fetchone()
         study = repo.get_study(article_id)
-        return {"completed": bool(progress), "completed_at": progress["completed_at"] if progress else None,
-                "study": json.loads(study["study_json"]) if study else None,
+        return {"study": json.loads(study["study_json"]) if study else None,
                 "provider": study["provider"] if study else None}
     finally:
         repo.close()
 
 
-@app.post("/api/notebook/{article_id}/complete")
-def complete_notebook_item(article_id: str, request: Request) -> dict:
-    _require_notebook_access(request)
+@app.post("/api/study/{article_id}")
+def create_study_item(article_id: str) -> dict:
     repo = Repository(_database_path())
     try:
         row = repo.get_article(article_id)
@@ -224,6 +211,9 @@ def complete_notebook_item(article_id: str, request: Request) -> dict:
             study = json.loads(saved["study_json"])
             provider = saved["provider"]
         else:
+            day = datetime.now(timezone.utc).date().isoformat()
+            if not repo.reserve_study_generation(day, daily_limit=20):
+                raise HTTPException(status_code=429, detail="The daily free-tier study-kit limit has been reached. Please try again tomorrow; saved kits are still available.")
             article = dict(row)
             document = repo.get_article_document(article_id)
             if document and document["status"] == "ready":
@@ -236,9 +226,7 @@ def complete_notebook_item(article_id: str, request: Request) -> dict:
             saved = repo.get_study(article_id)
             study = json.loads(saved["study_json"])
             provider = saved["provider"]
-        repo.mark_completed(article_id)
-        progress = repo.conn.execute("SELECT completed_at FROM reading_progress WHERE article_id=?", (article_id,)).fetchone()
-        return {"completed": True, "completed_at": progress["completed_at"], "study": study, "provider": provider}
+        return {"completed": True, "study": study, "provider": provider}
     except HTTPException:
         raise
     except RuntimeError as exc:

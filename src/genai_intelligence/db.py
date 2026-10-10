@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS reading_progress (
   article_id TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
   completed_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS study_generation_limits (
+  day TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS weekly_editions (
   week_id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, article_ids_json TEXT NOT NULL,
   story_count INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'published'
@@ -100,6 +103,9 @@ CREATE TABLE IF NOT EXISTS article_studies (
 CREATE TABLE IF NOT EXISTS reading_progress (
   article_id TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
   completed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS study_generation_limits (
+  day TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS weekly_editions (
   week_id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, article_ids_json TEXT NOT NULL,
@@ -271,6 +277,19 @@ class Repository:
           VALUES(?,?,?,?,?) ON CONFLICT(article_id) DO NOTHING""",
           (article_id, json.dumps(study, ensure_ascii=False), provider, model, datetime.now(timezone.utc).isoformat()))
         self.conn.commit()
+
+    def reserve_study_generation(self, day: str, daily_limit: int = 20) -> bool:
+        """Atomically reserve one public study-kit generation for this UTC day."""
+        self.conn.execute(
+            "INSERT INTO study_generation_limits(day,count) VALUES(?,0) ON CONFLICT(day) DO NOTHING",
+            (day,),
+        )
+        result = self.conn.execute(
+            "UPDATE study_generation_limits SET count=count+1 WHERE day=? AND count<?",
+            (day, daily_limit),
+        )
+        self.conn.commit()
+        return result.rowcount == 1
 
     def get_article_document(self, article_id: str):
         return self.conn.execute("SELECT * FROM article_documents WHERE article_id=?", (article_id,)).fetchone()

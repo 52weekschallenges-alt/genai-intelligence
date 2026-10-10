@@ -2,13 +2,17 @@ const escapeText = (value) => String(value ?? "").replace(/[&<>\"]/g, (char) => 
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;"
 }[char]));
 
-function getNotebookToken() {
-  let token = localStorage.getItem("notebook-token");
-  if (!token) {
-    token = prompt("Enter your NOTEBOOK_ACCESS_TOKEN from the site owner");
-    if (token) localStorage.setItem("notebook-token", token.trim());
-  }
-  return token;
+const COMPLETED_KEY = "genai-intelligence-completed-articles";
+
+function completedArticles() {
+  try { return new Set(JSON.parse(localStorage.getItem(COMPLETED_KEY) || "[]")); }
+  catch { return new Set(); }
+}
+
+function markArticleCompleted(articleId) {
+  const completed = completedArticles();
+  completed.add(articleId);
+  localStorage.setItem(COMPLETED_KEY, JSON.stringify([...completed]));
 }
 
 function renderStudy(container, data) {
@@ -91,37 +95,26 @@ function renderStudy(container, data) {
 }
 
 async function loadProgress(button) {
-  const token = localStorage.getItem("notebook-token");
-  if (!token) return;
+  if (completedArticles().has(button.dataset.id)) button.textContent = "Completed · review study kit";
   try {
-    const response = await fetch(`/api/notebook/${encodeURIComponent(button.dataset.id)}`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
+    const response = await fetch(`/api/study/${encodeURIComponent(button.dataset.id)}`);
     if (!response.ok) return;
     const data = await response.json();
-    if (data.completed) {
-      button.textContent = "Completed · review study kit";
-      if (data.study) renderStudy(document.getElementById(`study-${button.dataset.id}`), data);
-    }
+    if (data.study) renderStudy(document.getElementById(`study-${button.dataset.id}`), data);
   } catch { /* A temporarily unavailable database should not break reading. */ }
 }
 
 document.querySelectorAll("button.complete").forEach((button) => {
   loadProgress(button);
   button.addEventListener("click", async () => {
-    const token = getNotebookToken();
-    if (!token) return;
     button.disabled = true;
     button.textContent = "Creating your saved study kit…";
     const target = document.getElementById(`study-${button.dataset.id}`);
     try {
-      const response = await fetch(`/api/notebook/${encodeURIComponent(button.dataset.id)}/complete`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const response = await fetch(`/api/study/${encodeURIComponent(button.dataset.id)}`, { method: "POST" });
       const data = await response.json();
-      if (response.status === 401) localStorage.removeItem("notebook-token");
       if (!response.ok) throw new Error(data.detail || "Could not create study kit");
+      markArticleCompleted(button.dataset.id);
       button.textContent = "Completed · review study kit";
       renderStudy(target, data);
     } catch (error) {

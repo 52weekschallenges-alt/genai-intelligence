@@ -1,0 +1,66 @@
+# GenAI Intelligence V0.1
+
+A zero-cost, source-linked GenAI technology newspaper. It collects public RSS/Atom feeds and public GitHub, Hugging Face Hub, and arXiv API results into SQLite, and includes a searchable web reader. It does not call an LLM or any paid service.
+
+## What is included
+
+- A YAML source registry at `config/sources.yaml`, including the four requested feeds, additional official/editorial feeds, and API-backed sources.
+- A shared article model with source, identity, title, canonical URL, summary/content, author, timestamps, categories, trust score, and source metadata.
+- SQLite tables for sources, articles, and ingestion runs, with indexes and idempotent upserts.
+- RSS/Atom, GitHub Search API, Hugging Face Models API, and arXiv Atom API collectors.
+- A CLI for listing sources, ingesting, browsing recent articles, and checking database counts, plus a searchable web reader and JSON API.
+- A Dockerfile and Docker Compose configuration for hosting with persistent storage and daily scheduled collection.
+- Tests for source loading, URL normalization, idempotency, and collection failures.
+
+## Run locally
+
+Requires Python 3.10 or later.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\\Scripts\\activate
+python -m pip install -e '.[dev]'
+cp .env.example .env             # optional; credentials are not required
+genai-intel sources
+genai-intel ingest
+genai-intel articles --limit 20
+genai-intel stats
+uvicorn genai_intelligence.web:app --reload
+```
+
+The reader is available at `http://127.0.0.1:8000`; the JSON API is at `/api/articles`, and `/health` is the health check. The web service starts collection on startup and repeats every 24 hours. Set `ENABLE_INGESTION=false` to serve only already-collected data, or change `INGEST_INTERVAL_HOURS`. The command defaults to `config/sources.yaml` and `data/genai_intelligence.sqlite3`. Override these with `--config`, `--db`, `GENAI_INTEL_CONFIG`, or `GENAI_INTEL_DB`. A `GITHUB_TOKEN` or `HF_TOKEN` environment variable is optional and only raises public API rate limits. No `.env` loader is required; export values in your shell or use your preferred dotenv tool.
+
+## Run as a hosted web service
+
+The repository includes a Docker image and Compose setup. Compose keeps the SQLite database in a named persistent volume and runs the web reader and scheduled collector together:
+
+```bash
+docker compose up --build
+```
+
+Open `http://localhost:8000`. Check `http://localhost:8000/health` and `http://localhost:8000/api/articles`. Stop the service with `Ctrl+C`; the named `newspaper-data` volume keeps collected data across container rebuilds.
+
+To publish externally, deploy this Dockerfile to a container host that supports persistent disks or volumes. Mount persistent storage at `/data`, expose the configured `PORT` (default `8000`), and set `GENAI_INTEL_DB=/data/genai_intelligence.sqlite3`. Keep `GENAI_INTEL_CONFIG=/app/config/sources.yaml`, `ENABLE_INGESTION=true`, and `INGEST_ON_STARTUP=true`. The service serves a public, read-only API and reader page; it has no accounts or private user data in V0.1. Use one service instance with SQLite; multiple replicas need a shared database such as PostgreSQL and a separate scheduler design.
+
+### Deploy on Vercel (free personal project)
+
+1. Put this repository on GitHub, GitLab, or Bitbucket and import it into Vercel. You can make the app source public/open-source; Vercel itself is a hosted service, not open-source software. You do not need to install Vercel tooling on your computer for Git based deployment.
+2. Create a Neon Postgres database using the free plan and copy its pooled connection string into the Vercel project's `DATABASE_URL` environment variable.
+3. Add a random secret as `CRON_SECRET` in Vercel project environment variables. Do not commit the real value to the repository. Leave `ENABLE_INGESTION` unset or set it to `false`; Vercel Cron handles collection.
+4. Deploy the project. The included Vercel configuration runs collection daily and allows the function up to five minutes. Vercel's Hobby cron supports once-daily schedules, which suits this newspaper.
+5. Visit the deployment URL and `/api/articles`; the first collection runs at the next scheduled time. Run the cron route manually from Vercel's Cron Jobs page after deployment to populate the first issue immediately.
+
+In Vercel, `DATABASE_URL` switches the repository layer from local SQLite to Postgres so articles persist across serverless invocations. Vercel's free Hobby plan is for personal, non-commercial projects; plan limits and Neon free allowances can change, so check their current terms before public growth. [Vercel Python/FastAPI support](https://vercel.com/docs/functions/runtimes/python), [Vercel Hobby plan](https://vercel.com/docs/plans/hobby), [Vercel Cron limits](https://vercel.com/docs/cron-jobs/manage-cron-jobs), [Neon integration](https://vercel.com/marketplace/neon).
+
+
+Run the test suite with `python -m pytest`.
+
+## Configure sources
+
+Each `sources` entry has required `id`, `name`, `type`, and `url` fields. `type` is one of `rss`, `github`, `huggingface`, or `arxiv`. `categories`, `trust_score` (0–1), and `enabled` are optional. Other fields are passed to the relevant collector, such as `query`, `per_page`, `task`, or `max_results`. Invalid/duplicate IDs and out-of-range trust scores fail registry loading. HTTP URLs for `export.arxiv.org` are upgraded to HTTPS.
+
+Collection errors are isolated per source, recorded in `ingestion_runs`, reported in the CLI output, and cause `ingest` to return a nonzero status if any source failed. Re-running a collection updates records by source identity and avoids duplicating them. URL canonicalization removes fragments and common tracking parameters. Similar stories arriving from different sources remain distinct records so their provenance is retained.
+
+## V0.1 boundaries
+
+The database stores raw source metadata and normalized article records. Ranking, personalization, clustering across publishers, and summarization are later steps. `trust_score` and categories are source defaults, not claims that an article has been editorially reviewed.

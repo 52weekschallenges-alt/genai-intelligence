@@ -1,0 +1,98 @@
+version: 1
+sources:
+  # High-signal editorial and open-model coverage
+  - id: huggingface_blog
+    name: Hugging Face Blog
+    type: rss
+    url: https://huggingface.co/blog/feed.xml
+    categories: [foundation_models, open_source, research, agents, multimodal]
+    trust_score: 0.90
+    enabled: true
+  - id: deeplearning_ai_batch
+    name: DeepLearning.AI - The Batch
+    type: rss
+    url: https://www.deeplearning.ai/the-batch/feed/
+    categories: [ai_research, foundation_models, agents, ai_products, industry]
+    trust_score: 0.88
+    enabled: true
+  - id: interconnects
+    name: Interconnects
+    type: rss
+    url: https://www.interconnects.ai/feed
+    categories: [foundation_models, open_source, reasoning, post_training, research]
+    trust_score: 0.93
+    enabled: true
+  - id: arxiv_cs_ai
+    name: arXiv - Computer Science AI
+    type: rss
+    url: https://export.arxiv.org/rss/cs.AI
+    categories: [ai_research, agents, reasoning, foundation_models]
+    trust_score: 0.90
+    enabled: true
+  # Official release and research feeds
+  - id: openai_news
+    name: OpenAI News
+    type: rss
+    url: https://openai.com/news/rss.xml
+    categories: [foundation_models, ai_products, research, industry]
+    trust_score: 0.95
+    enabled: true
+  - id: google_deepmind_blog
+    name: Google DeepMind Blog
+    type: rss
+    url: https://deepmind.google/blog/rss.xml
+    categories: [ai_research, foundation_models, multimodal, robotics]
+    trust_score: 0.95
+    enabled: true
+  - id: anthropic_news
+    name: Anthropic News
+    type: rss
+    url: https://www.anthropic.com/news/rss.xml
+    categories: [foundation_models, ai_products, safety, research]
+    trust_score: 0.95
+    enabled: true
+  - id: microsoft_research_ai
+    name: Microsoft Research AI
+    type: rss
+    url: https://www.microsoft.com/en-us/research/feed/?filter=publication-type&value=blog
+    categories: [ai_research, industry, agents]
+    trust_score: 0.91
+    enabled: true
+  - id: github_blog_ai
+    name: GitHub Blog - AI
+    type: rss
+    url: https://github.blog/tag/ai/feed/
+    categories: [ai_products, developer_tools, agents, open_source]
+    trust_score: 0.90
+    enabled: true
+
+  # API-backed collectors; queries are configurable per source.
+  - id: github_trending_ai
+    name: GitHub AI repositories
+    type: github
+    url: https://api.github.com/search/repositories
+    query: 'topic:artificial-intelligence OR topic:llm OR topic:generative-ai'
+    sort: updated
+    per_page: 30
+    categories: [open_source, developer_tools, foundation_models]
+    trust_score: 0.80
+    enabled: true
+  - id: huggingface_models
+    name: Hugging Face recently updated models
+    type: huggingface
+    url: https://huggingface.co/api/models
+    task: text-generation
+    limit: 30
+    sort: lastModified
+    categories: [open_source, foundation_models]
+    trust_score: 0.82
+    enabled: true
+  - id: arxiv_cs_lg
+    name: arXiv - Machine Learning
+    type: arxiv
+    url: https://export.arxiv.org/api/query
+    query: 'cat:cs.LG'
+    max_results: 30
+    categories: [ai_research, machine_learning, research]
+    trust_score: 0.90
+    enabled: true

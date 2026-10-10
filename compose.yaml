@@ -1,0 +1,18 @@
+services:
+  genai-intelligence:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+      GENAI_INTEL_DB: /data/genai_intelligence.sqlite3
+      GENAI_INTEL_CONFIG: /app/config/sources.yaml
+      INGEST_INTERVAL_HOURS: "24"
+      INGEST_ON_STARTUP: "true"
+      ENABLE_INGESTION: "true"
+    volumes:
+      - newspaper-data:/data
+    restart: unless-stopped
+
+volumes:
+  newspaper-data:

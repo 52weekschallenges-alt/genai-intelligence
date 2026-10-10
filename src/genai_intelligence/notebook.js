@@ -132,33 +132,3 @@ document.querySelectorAll("button.complete").forEach((button) => {
     }
   });
 });
-
-const buildNow = document.getElementById("build-now");
-if (buildNow) {
-  buildNow.addEventListener("click", async () => {
-    const token = getNotebookToken();
-    if (!token) return;
-    const status = document.getElementById("build-status");
-    buildNow.disabled = true;
-    status.textContent = "Fetching full documents and creating embeddings… this can take a few minutes.";
-    try {
-      const headers = { Authorization: `Bearer ${token}` };
-      let response = await fetch("/api/notebook/index-now", { method: "POST", headers });
-      let data = await response.json();
-      if (response.status === 401) localStorage.removeItem("notebook-token");
-      if (!response.ok) throw new Error(data.detail || data.error || "Indexing did not complete");
-      status.textContent = `Index run: ${data.indexed || 0} indexed, ${data.failed || 0} could not be read, ${data.skipped || 0} already current. Preparing your long-form analyses…`;
-      response = await fetch("/api/notebook/edition-now", { method: "POST", headers });
-      data = await response.json();
-      if (response.status === 401) localStorage.removeItem("notebook-token");
-      if (!response.ok) throw new Error(data.detail || data.error || "Analysis generation did not complete");
-      status.textContent = data.status === "published"
-        ? `Your edition is ready with ${data.stories} deep reads. Refreshing…`
-        : `Edition status: ${data.status}. ${data.prepared_stories || 0} analyses are ready; the scheduled job will continue the saved draft.`;
-      window.setTimeout(() => window.location.reload(), data.status === "published" ? 1200 : 5000);
-    } catch (error) {
-      status.textContent = `${error.message}. Your indexing progress is saved; you can retry.`;
-      buildNow.disabled = false;
-    }
-  });
-}

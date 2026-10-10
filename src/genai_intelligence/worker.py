@@ -36,6 +36,19 @@ def _phase(repo: Repository, name: str, operation) -> dict:
                 status = "waiting"
             else:
                 status = "partial"
+        if name in {"index", "edition"}:
+            attempts = []
+            for row in repo.recent_external_requests(100):
+                if row["created_at"] < started or row["operation"] == "metadata_health_check":
+                    continue
+                attempts.append({key: row[key] for key in (
+                    "service", "operation", "model", "outcome", "http_status",
+                    "latency_ms", "error_type", "error_detail")})
+            result["provider_requests"] = attempts
+        if name == "index" and result.get("failed", 0):
+            result["document_failures"] = [dict(row) for row in repo.conn.execute("""SELECT a.title,
+              a.source_id,d.error FROM article_documents d JOIN articles a ON a.id=d.article_id
+              WHERE d.status='failed' ORDER BY d.indexed_at DESC LIMIT 8""").fetchall()]
         repo.finish_pipeline_run(run_id, _now(), status, {"result": result})
         record = {"phase": name, "status": status, "result": result}
         _report(record)

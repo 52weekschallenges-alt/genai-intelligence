@@ -27,7 +27,9 @@ def ingest_source(repo: Repository, source: Source, collector: Callable[[Source]
             same_url = repo.has_article(article.source_id, None, article.url)
             if same_url and not same_id:
                 continue
-            repo.save_article(article)
+            # Commit the source batch once in record_run() instead of forcing a
+            # database round trip for every item in large RSS feeds.
+            repo.save_article(article, commit=False)
             if not same_id:
                 inserted += 1
         finished = datetime.now(timezone.utc).isoformat()

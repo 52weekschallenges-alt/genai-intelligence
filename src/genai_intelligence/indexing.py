@@ -34,6 +34,16 @@ INDEXABLE_SOURCE_TYPES = {"rss", "arxiv"}
 USER_AGENT = "GenAI-Intelligence/0.5 (+source-indexer; contact via project repository)"
 
 
+def _failure_detail(exc: Exception) -> str:
+    response = getattr(exc, "response", None)
+    if response is not None:
+        host = getattr(getattr(response, "url", None), "host", "provider")
+        return f"{type(exc).__name__}: HTTP {response.status_code} from {host}"
+    if isinstance(exc, httpx.TimeoutException):
+        return f"{type(exc).__name__}: document request timed out"
+    return f"{type(exc).__name__}: {' '.join(str(exc).split())[:250]}"
+
+
 def _fingerprint(article: dict) -> str:
     fields = [article.get(key) or "" for key in ("title", "url", "summary", "content", "updated_at", "published_at")]
     return hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode()).hexdigest()
@@ -263,10 +273,11 @@ def index_recent_documents(repo: Repository, *, now: datetime | None = None,
                 chunks=list(zip(chunks, vectors)))
             indexed += 1
         except Exception as exc:
-            logger.warning("Document index failed for %s (%s)", article.get("id", "")[:10], type(exc).__name__)
+            detail = _failure_detail(exc)
+            logger.warning("Document index failed for %s: %s", article.get("id", "")[:10], detail)
             try:
                 repo.save_index_failure(article["id"], source_fingerprint=fingerprint,
-                                        error=type(exc).__name__, embedding_model=model)
+                                        error=detail, embedding_model=model)
             except Exception:
                 logger.exception("Unable to persist indexing failure")
             failed += 1

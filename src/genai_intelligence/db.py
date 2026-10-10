@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS external_service_health (
 CREATE TABLE IF NOT EXISTS external_request_logs (
   id TEXT PRIMARY KEY, created_at TEXT NOT NULL, service TEXT NOT NULL,
   operation TEXT NOT NULL, model TEXT NOT NULL, endpoint TEXT NOT NULL,
-  outcome TEXT NOT NULL, http_status INTEGER, latency_ms INTEGER, error_type TEXT
+  outcome TEXT NOT NULL, http_status INTEGER, latency_ms INTEGER, error_type TEXT,
+  error_detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_external_request_logs_created ON external_request_logs(created_at DESC);
 CREATE TABLE IF NOT EXISTS internal_http_request_logs (
@@ -143,7 +144,8 @@ CREATE TABLE IF NOT EXISTS external_service_health (
 CREATE TABLE IF NOT EXISTS external_request_logs (
   id TEXT PRIMARY KEY, created_at TEXT NOT NULL, service TEXT NOT NULL,
   operation TEXT NOT NULL, model TEXT NOT NULL, endpoint TEXT NOT NULL,
-  outcome TEXT NOT NULL, http_status INTEGER, latency_ms INTEGER, error_type TEXT
+  outcome TEXT NOT NULL, http_status INTEGER, latency_ms INTEGER, error_type TEXT,
+  error_detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_external_request_logs_created ON external_request_logs(created_at DESC);
 CREATE TABLE IF NOT EXISTS internal_http_request_logs (
@@ -243,6 +245,11 @@ class Repository:
             columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(ingestion_runs)").fetchall()}
             if "latency_ms" not in columns:
                 self.conn.execute("ALTER TABLE ingestion_runs ADD COLUMN latency_ms INTEGER")
+            request_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(external_request_logs)").fetchall()}
+            if "error_detail" not in request_columns:
+                self.conn.execute("ALTER TABLE external_request_logs ADD COLUMN error_detail TEXT")
+        if self.backend == "postgres":
+            self.conn.execute("ALTER TABLE external_request_logs ADD COLUMN IF NOT EXISTS error_detail TEXT")
         self.conn.commit()
 
     def _apply_topic_taxonomy(self) -> None:
@@ -278,7 +285,7 @@ class Repository:
            int(source.enabled), datetime.now(timezone.utc).isoformat()))
         self.conn.commit()
 
-    def save_article(self, article: Article) -> bool:
+    def save_article(self, article: Article, *, commit: bool = True) -> bool:
         canonical = canonicalize_url(article.url)
         identity = article.item_id or canonical
         article_id = hashlib.sha256(f"{article.source_id}\0{identity}".encode()).hexdigest()
@@ -295,7 +302,8 @@ class Repository:
           (article_id, article.source_id, article.item_id, article.title, article.url, canonical, article.summary,
            article.content, article.author, data["published_at"], data["updated_at"], json.dumps(article.categories),
            article.trust_score, article.language, json.dumps(article.metadata, ensure_ascii=False, default=str), data["collected_at"]))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         # Rowcount reports 1 for insert and update; use total_changes-independent pre-check.
         return cur.rowcount > 0
 
@@ -381,12 +389,14 @@ class Repository:
 
     def record_external_request(self, request_id: str, *, created_at: str, service: str,
                                 operation: str, model: str, endpoint: str, outcome: str,
-                                http_status: int | None, latency_ms: int, error_type: str | None) -> None:
+                                http_status: int | None, latency_ms: int, error_type: str | None,
+                                error_detail: str | None = None) -> None:
         self.conn.execute("""INSERT INTO external_request_logs
-          (id,created_at,service,operation,model,endpoint,outcome,http_status,latency_ms,error_type)
-          VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING""",
+          (id,created_at,service,operation,model,endpoint,outcome,http_status,latency_ms,error_type,error_detail)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING""",
           (request_id, created_at, service, operation, model[:160], endpoint[:200], outcome,
-           http_status, latency_ms, error_type[:100] if error_type else None))
+           http_status, latency_ms, error_type[:100] if error_type else None,
+           error_detail[:500] if error_detail else None))
         cutoff_iso = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - 30 * 86400,
                                            timezone.utc).isoformat()
         self.conn.execute("DELETE FROM external_request_logs WHERE created_at<?", (cutoff_iso,))
@@ -411,7 +421,7 @@ class Repository:
 
     def recent_external_requests(self, limit: int = 100):
         return self.conn.execute("""SELECT service,operation,model,endpoint,outcome,http_status,
-          latency_ms,error_type,created_at FROM external_request_logs ORDER BY created_at DESC LIMIT ?""",
+          latency_ms,error_type,error_detail,created_at FROM external_request_logs ORDER BY created_at DESC LIMIT ?""",
           (limit,)).fetchall()
 
     def get_article_document(self, article_id: str):

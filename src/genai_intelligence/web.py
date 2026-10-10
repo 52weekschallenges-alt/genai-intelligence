@@ -644,7 +644,7 @@ def status_page() -> str:
     external_rows = "".join(
         f'<tr><td>{esc(item["service"])}<small>{esc(item["operation"])} · {esc(item["model"])}</small></td>'
         f'<td><span class="pill {"good" if item["outcome"] == "success" else "bad"}">{esc(item["outcome"])} · {esc(item["http_status"] or "no response")}</span>'
-        f'<small>{esc(item["error_type"] or "")}</small></td><td>{esc(item["latency_ms"])} ms</td><td>{stamp(item["created_at"])}</td></tr>'
+        f'<small>{esc(item["error_detail"] or item["error_type"] or "")}</small></td><td>{esc(item["latency_ms"])} ms</td><td>{stamp(item["created_at"])}</td></tr>'
         for item in snapshot["external_requests"])
     def source_request_row(item: dict) -> str:
         error = f'<small class="error">{esc(item["error"])}</small>' if item.get("error") else ""

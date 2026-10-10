@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Bootstrap the first issue or run the daily update"
+        description: "Initialize the database and first issue, or run the daily update"
         required: true
         type: choice
         options:
@@ -24,81 +24,42 @@ concurrency:
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
     env:
-      APP_URL: ${{ vars.VERCEL_APP_URL || 'https://genai-intelligence.vercel.app' }}
-      CRON_SECRET: ${{ secrets.VERCEL_CRON_SECRET }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
       MODE: ${{ inputs.mode || 'daily' }}
     steps:
-      - name: Check required connection setting
+      - name: Check backend configuration
         shell: bash
         run: |
-          if [[ -z "$CRON_SECRET" ]]; then
-            echo "Add the existing Vercel CRON_SECRET as the GitHub Actions secret VERCEL_CRON_SECRET."
+          if [[ -z "$DATABASE_URL" ]]; then
+            echo "Add the Neon Postgres connection string as the GitHub Actions secret DATABASE_URL."
             exit 1
           fi
-          echo "Backend target: $APP_URL"
-          echo "Run mode: $MODE"
-
-      - name: Collect, index, and publish
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          call_endpoint() {
-            local route="$1"
-            curl --silent --show-error --fail-with-body \
-              --connect-timeout 10 --max-time 310 --retry 2 --retry-all-errors \
-              -H "Authorization: Bearer ${CRON_SECRET}" \
-              "${APP_URL}/api/cron/${route}"
-          }
-
-          collect_response="$(call_endpoint collect)"
-          echo "## Collection" >> "$GITHUB_STEP_SUMMARY"
-          echo '```json' >> "$GITHUB_STEP_SUMMARY"
-          echo "$collect_response" | jq . >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-          if [[ "$MODE" == "daily" ]]; then
-            index_response="$(call_endpoint index)"
-            echo "## Indexing" >> "$GITHUB_STEP_SUMMARY"
-            echo '```json' >> "$GITHUB_STEP_SUMMARY"
-            echo "$index_response" | jq . >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-            edition_response="$(call_endpoint edition)"
-            echo "## Weekly edition" >> "$GITHUB_STEP_SUMMARY"
-            echo '```json' >> "$GITHUB_STEP_SUMMARY"
-            echo "$edition_response" | jq . >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            if [[ "$(echo "$edition_response" | jq -r '.status // empty')" == "waiting_for_provider" ]]; then
-              echo "The edition step could not reach a text-generation provider. See the Vercel run details and /status." >&2
-              exit 1
-            fi
-            exit 0
+          if [[ -z "$GEMINI_API_KEY" ]]; then
+            echo "Add GEMINI_API_KEY as a GitHub Actions secret; the indexer needs it for embeddings."
+            exit 1
           fi
+          if [[ -z "$GROQ_API_KEY" ]]; then
+            echo "GROQ_API_KEY is not set. The worker can use Gemini for analysis if its free quota permits."
+          fi
+          echo "Mode: $MODE"
 
-          # First launch: work through several small, tracked batches so the first
-          # complete issue can be prepared before the public reader is released.
-          for batch in 1 2 3 4; do
-            echo "### Bootstrap batch ${batch}" >> "$GITHUB_STEP_SUMMARY"
-            index_response="$(call_endpoint index)"
-            echo "Index response: $(echo "$index_response" | jq -c .)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Start independent backend worker
+        uses: actions/checkout@v4
 
-            edition_response="$(call_endpoint edition)"
-            edition_status="$(echo "$edition_response" | jq -r '.status // empty')"
-            echo "Edition response: $(echo "$edition_response" | jq -c .)" >> "$GITHUB_STEP_SUMMARY"
-            if [[ "$edition_status" == "waiting_for_provider" ]]; then
-              echo "Text generation is unavailable. The reader will remain in preparation mode." >&2
-              exit 1
-            fi
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
 
-            status_response="$(curl --silent --show-error --fail-with-body --connect-timeout 10 --max-time 30 "${APP_URL}/api/status")"
-            current_edition="$(echo "$status_response" | jq -r '.current_edition.status // empty')"
-            if [[ "$current_edition" == "published" ]]; then
-              echo "First issue is published. The reader is ready." >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-          done
+      - name: Install backend
+        run: python -m pip install .
 
-          echo "Bootstrap is still in progress. The daily workflow will continue it; rerun Bootstrap from Actions to continue sooner." >> "$GITHUB_STEP_SUMMARY"
+      - name: Collect, index, and publish directly to Postgres
+        run: python -m genai_intelligence.worker --mode "$MODE"

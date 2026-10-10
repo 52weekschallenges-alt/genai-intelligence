@@ -527,7 +527,6 @@ def status_api() -> dict:
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "database": {"status": "connected", "backend": repo.backend},
             "configuration": {
-                "cron_secret_configured": bool(os.getenv("CRON_SECRET", "").strip()),
                 "embedding_key_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
                 "study_and_analysis_provider_configured": bool(os.getenv("GROQ_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip()),
             },
@@ -555,9 +554,9 @@ def status_api() -> dict:
                 {"path": "/", "purpose": "Reader"}, {"path": "/health", "purpose": "App health"},
                 {"path": "/api/status", "purpose": "This dashboard and database status"},
                 {"path": "/api/articles", "purpose": "Article API"}, {"path": "/api/sources", "purpose": "Source registry API"},
-                {"path": "/api/cron/collect", "purpose": "Backend collector · protected"},
-                {"path": "/api/cron/index", "purpose": "Backend indexer · protected"},
-                {"path": "/api/cron/edition", "purpose": "Backend edition writer · protected"},
+                {"path": "/api/cron/collect", "purpose": "Manual collector API · protected"},
+                {"path": "/api/cron/index", "purpose": "Manual indexer API · protected"},
+                {"path": "/api/cron/edition", "purpose": "Manual edition API · protected"},
             ],
         }
     finally:
@@ -682,16 +681,16 @@ def status_page() -> str:
         situation_body = (f'{count["articles"]:,} articles are in the library, but 0 are indexed. Without indexed full text, the LLM cannot write deep reads. '
                           f'Provider metadata checks: {reachable}/{configured} reachable; these do not test content generation or embeddings.')
         if not snapshot["configuration"]["embedding_key_configured"]:
-            next_step = "Next: configure GEMINI_API_KEY in Vercel. The indexer needs it to create document embeddings."
+            next_step = "Next: check that GEMINI_API_KEY is set in GitHub Actions secrets; the independent backend worker needs it for embeddings."
         elif not index_run or index_run.get("status") in {"observed", "not run yet"}:
-            next_step = "Next: check Vercel Cron Jobs and Function Logs for /api/cron/index. This dashboard has no recorded index run yet."
+            next_step = "Next: start the GenAI newspaper backend workflow from the GitHub Actions tab. This database has no recorded index run yet."
         else:
-            next_step = "Next: open the latest Index full documents result above and its Vercel Function Log; that run should show whether the embedding request failed."
+            next_step = "Next: open the latest Index full documents result above and the matching GitHub Actions run for detailed worker output."
         callout_class = "danger"
     elif not analysis:
         situation_title = "Documents are indexed, but no long-form analysis has succeeded yet."
         situation_body = f'{count["indexed_full_text"]:,} full-text documents are ready. Provider metadata checks: {reachable}/{configured} reachable; check the edition run for actual generation or quota errors.'
-        next_step = "Next: inspect the Write weekly reads run above and its Vercel Function Log for the provider response."
+        next_step = "Next: inspect the Write weekly reads result above and the matching GitHub Actions run for provider errors."
         callout_class = "warn"
     else:
         situation_title = "The pipeline has produced long-form reads."
@@ -705,13 +704,13 @@ def status_page() -> str:
 </style></head><body><main><header><div class="top"><div><h1>System status</h1><p>Pipeline progress and last known source checks. Refreshes every 60 seconds.</p></div><a href="/">← Back to newspaper</a></div><p>Updated {stamp(snapshot["checked_at"])} · Database: <span class="pill good">{esc(snapshot["database"]["status"])} ({esc(snapshot["database"]["backend"])})</span> · Current edition: <span class="pill">{esc(edition_status)}</span></p></header>
 <section class="callout {callout_class}"><h2>What this means</h2><p><strong>{esc(situation_title)}</strong></p><p>{esc(situation_body)}</p><p><strong>{esc(next_step)}</strong></p></section>
 <section class="panel"><h2>Library progress</h2><div class="metrics"><span class="metric"><strong>{count["sources"]}</strong> enabled sources</span><span class="metric"><strong>{count["articles"]:,}</strong> collected articles</span><span class="metric"><strong>{count["indexed_ready"]:,}</strong> indexed docs</span><span class="metric"><strong>{count["indexed_full_text"]:,}</strong> full text</span><span class="metric"><strong>{count["indexed_failed"]:,}</strong> indexing failures</span><span class="metric"><strong>{count["analyses"]:,}</strong> deep reads</span><span class="metric"><strong>{count["published_editions"]:,}</strong> saved editions</span></div></section>
-<h2>Scheduled pipeline</h2><div class="grid">{"".join(phase_cards)}</div>
+<h2>Scheduled pipeline</h2><p>The independent GitHub Actions worker runs directly against Postgres. These phase results are saved in the database; the repository's Actions tab has the full runner output.</p><div class="grid">{"".join(phase_cards)}</div>
 <section class="panel"><h2>External feeds and APIs</h2><p>These show the outcome of the latest scheduled collection; opening a row visits that source.</p><div class="scroll"><table><thead><tr><th>Source endpoint</th><th>Last result</th><th>Last checked</th><th>Collection</th></tr></thead><tbody>{sources_html}</tbody></table></div></section>
 <section class="panel"><h2>Recent source request history</h2><p>Individual feed/API collection attempts with result, item counts, latency, and any error. Showing the latest {len(snapshot["source_requests"])} attempts.</p><div class="scroll"><table><thead><tr><th>Source</th><th>Result</th><th>Time</th><th>When / error</th></tr></thead><tbody>{source_request_rows or '<tr><td colspan="4">No source requests logged yet.</td></tr>'}</tbody></table></div></section>
 <section class="panel"><h2>LLM and embedding endpoint health</h2><p>Checks call provider model-metadata endpoints every 15 minutes at most. They verify the key and configured model can be reached; they do not generate text or embeddings or consume model tokens.</p><div class="scroll"><table><thead><tr><th>Provider/model</th><th>Reachability</th><th>Last checked</th><th>Response</th></tr></thead><tbody>{providers_html}</tbody></table></div><h3>Last successful real work</h3><p>Embedding: {esc(embedding_status)}{esc(embedding_error)}</p><p>Long-form analysis: {esc(analysis_status)}</p><p>Study kit: {esc(study_status)}</p></section>
 <section class="panel"><h2>Actual model and embedding requests</h2><p>These are real generation and embedding calls, with result and response time. Prompts, credentials, and response bodies are not stored.</p><div class="scroll"><table><thead><tr><th>Provider / operation</th><th>Result</th><th>Time</th><th>When</th></tr></thead><tbody>{external_rows or '<tr><td colspan="4">No real model or embedding request has been made yet.</td></tr>'}</tbody></table></div></section>
 <section class="panel"><h2>App and backend request log</h2><p>Last {len(snapshot["internal_requests"])} requests (up to 30 days retained). Route, HTTP result, latency, and error type are logged; query strings, IP addresses, and request contents are excluded.</p><div class="scroll"><table><thead><tr><th>Request</th><th>Result</th><th>Time</th><th>When</th></tr></thead><tbody>{''.join(f'<tr><td><code>{esc(item["method"])} {esc(item["path"])}</code></td><td><span class="pill {"good" if item["status_code"] < 400 else "bad"}">{item["status_code"]}</span><small>{esc(item["error_type"] or "")}</small></td><td>{item["latency_ms"]} ms</td><td>{stamp(item["created_at"])}</td></tr>' for item in snapshot["internal_requests"]) or '<tr><td colspan="4">No requests logged yet.</td></tr>'}</tbody></table></div></section>
-<section class="panel"><h2>Configuration checks</h2><p>Database connection: <span class="pill good">Connected</span></p><p>Scheduled-job secret: <span class="pill {"good" if snapshot["configuration"]["cron_secret_configured"] else "bad"}">{"configured" if snapshot["configuration"]["cron_secret_configured"] else "missing"}</span></p><p>Embedding key: <span class="pill {"good" if snapshot["configuration"]["embedding_key_configured"] else "bad"}">{"configured" if snapshot["configuration"]["embedding_key_configured"] else "missing"}</span></p><p>Analysis/study provider: <span class="pill {"good" if snapshot["configuration"]["study_and_analysis_provider_configured"] else "bad"}">{"configured" if snapshot["configuration"]["study_and_analysis_provider_configured"] else "missing"}</span></p></section>
+<section class="panel"><h2>Configuration checks</h2><p>Database connection: <span class="pill good">Connected</span></p><p>Embedding key for reader-side tasks: <span class="pill {"good" if snapshot["configuration"]["embedding_key_configured"] else "bad"}">{"configured" if snapshot["configuration"]["embedding_key_configured"] else "not configured in the web app"}</span></p><p>Analysis/study provider for reader-side tasks: <span class="pill {"good" if snapshot["configuration"]["study_and_analysis_provider_configured"] else "bad"}">{"configured" if snapshot["configuration"]["study_and_analysis_provider_configured"] else "not configured in the web app"}</span></p><p>The independent backend worker credentials are stored separately as GitHub Actions secrets.</p></section>
 <p class="muted">This dashboard reports recorded checks and configuration presence; it does not make extra paid monitoring or model calls.</p></main></body></html>'''
 
 

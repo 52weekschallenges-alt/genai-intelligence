@@ -32,7 +32,7 @@ def _phase(repo: Repository, name: str, operation) -> dict:
             result_status = result.get("status")
             if result_status in {"published", "already_published", "complete"}:
                 status = "partial" if result.get("failed", 0) else "success"
-            elif result_status in {"waiting_for_index", "waiting_for_provider", "waiting_for_embedding_key"}:
+            elif result_status in {"waiting_for_index", "waiting_for_provider", "waiting_for_embedding_key", "rate_limited"}:
                 status = "waiting"
             else:
                 status = "partial"
@@ -89,6 +89,10 @@ def run(mode: str) -> int:
                 return 0
             if edition["result"].get("status") == "waiting_for_provider":
                 return 1
+            if index_result["result"].get("status") == "rate_limited":
+                # Give the weekly edition a chance to use already-indexed
+                # documents, then let the next scheduled run retry embeddings.
+                break
         # Indexing and analysis are incremental; the scheduled run resumes the saved draft.
         saved = repo.get_weekly_edition(datetime.now(timezone.utc).strftime("%G-W%V"))
         if mode == "bootstrap" and not (saved and saved["status"] == "published"):

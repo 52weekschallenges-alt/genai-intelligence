@@ -50,7 +50,9 @@ sources:
     url: https://www.anthropic.com/news/rss.xml
     categories: [foundation_models, ai_products, safety, research]
     trust_score: 0.95
-    enabled: true
+    # This endpoint currently returns 404; keep the registry record visible but
+    # skip repeated failing requests until Anthropic publishes a valid feed URL.
+    enabled: false
   - id: microsoft_research_ai
     name: Microsoft Research AI
     type: rss
@@ -71,7 +73,7 @@ sources:
     name: GitHub AI repositories
     type: github
     url: https://api.github.com/search/repositories
-    query: 'topic:artificial-intelligence OR topic:llm OR topic:generative-ai'
+    query: 'topic:llm'
     sort: updated
     per_page: 30
     categories: [open_source, developer_tools, foundation_models]

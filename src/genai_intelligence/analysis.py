@@ -16,8 +16,12 @@ TIMEOUT = httpx.Timeout(100.0, connect=10.0)
 MIN_ANALYSIS_WORDS = 500
 
 
-def _prompt(article: dict, related: list[dict]) -> str:
-    main_text = str(article.get("indexed_document") or "")[:52000]
+def _prompt(article: dict, related: list[dict], *, compact: bool = False) -> str:
+    # Groq's free/on-demand TPM budget includes input and requested output tokens.
+    main_limit = 12000 if compact else 52000
+    related_limit = 800 if compact else 2200
+    related_count = 1 if compact else 3
+    main_text = str(article.get("indexed_document") or "")[:main_limit]
     sources = [{
         "id": "S1",
         "source": article.get("source_id"),
@@ -35,12 +39,14 @@ def _prompt(article: dict, related: list[dict]) -> str:
         seen.add(url)
         sources.append({"id": f"S{next_index}", "source": item.get("source_id"),
                         "title": item.get("title"), "url": url,
-                        "scope": "retrieved related passages", "text": item.get("content", "")[:2200]})
+                        "scope": "retrieved related passages", "text": item.get("content", "")[:related_limit]})
         next_index += 1
-        if len(sources) >= 4:
+        if len(sources) >= 1 + related_count:
             break
     related_reports = article.get("related_sources") or []
     for item in related_reports:
+        if compact:
+            break
         url = str(item.get("url") or "")
         if not url or url in seen or len(sources) >= 5:
             continue
@@ -105,7 +111,7 @@ def _groq(prompt: str) -> tuple[dict, str]:
                              endpoint="api.groq.com/openai/v1/chat/completions") as trace:
         response = httpx.post("https://api.groq.com/openai/v1/chat/completions", timeout=TIMEOUT,
             headers={"Authorization": f"Bearer {key}"},
-            json={"model": model, "temperature": 0.2, "max_tokens": 3800,
+            json={"model": model, "temperature": 0.2, "max_tokens": 2600,
                   "response_format": {"type": "json_object"},
                   "messages": [{"role": "user", "content": prompt}]})
         trace["http_status"] = response.status_code
@@ -125,10 +131,30 @@ def _gemini(prompt: str) -> tuple[dict, str]:
             timeout=TIMEOUT, headers={"x-goog-api-key": key},
             json={"contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {"temperature": 0.2, "maxOutputTokens": 3800,
-                                       "responseMimeType": "application/json"}})
+                    "responseFormat": {"text": {"mimeType": "application/json", "schema": {
+                      "type": "object",
+                      "properties": {
+                        "executive_takeaway": {"type": "string"},
+                        "sections": {"type": "array", "items": {"type": "object", "properties": {
+                          "heading": {"type": "string"},
+                          "paragraphs": {"type": "array", "items": {"type": "string"}}},
+                          "required": ["heading", "paragraphs"]}},
+                        "key_points": {"type": "array", "items": {"type": "string"}},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "scope_note": {"type": "string"},
+                        "source_refs": {"type": "array", "items": {"type": "string"}}},
+                      "required": ["executive_takeaway", "sections", "key_points", "confidence", "scope_note", "source_refs"]}}}}})
         trace["http_status"] = response.status_code
         response.raise_for_status()
-        content = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        payload = response.json()
+        candidates = payload.get("candidates") or []
+        if not candidates:
+            raise ValueError("Gemini returned no analysis candidate")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        content = next((part.get("text", "") for part in parts if part.get("text")), "")
+        if not content:
+            reason = candidates[0].get("finishReason", "unknown")
+            raise ValueError(f"Gemini returned no analysis text (finish reason: {reason})")
         return _validate(json.loads(content)), model
 
 
@@ -136,8 +162,8 @@ def generate_analysis(article: dict, related: list[dict] | None = None) -> tuple
     """Generate a full notebook analysis, with provider fallback and a length floor."""
     if not str(article.get("indexed_document") or "").strip():
         raise ValueError("A full indexed document is required for deep analysis")
-    prompt = _prompt(article, related or [])
-    evidence = json.loads(prompt.split("Indexed evidence (JSON data):\n", 1)[1])
+    prompts = {"groq": _prompt(article, related or [], compact=True),
+               "gemini": _prompt(article, related or [])}
     providers = []
     if os.getenv("GROQ_API_KEY", "").strip():
         providers.append(("groq", _groq))
@@ -148,7 +174,8 @@ def generate_analysis(article: dict, related: list[dict] | None = None) -> tuple
     failures = []
     for name, generate in providers:
         try:
-            analysis, model = generate(prompt)
+            analysis, model = generate(prompts[name])
+            evidence = json.loads(prompts[name].split("Indexed evidence (JSON data):\n", 1)[1])
             analysis["document_scope"] = article.get("content_scope", "unknown")
             analysis["sources"] = [{"source_id": source.get("source"), "title": source.get("title"),
                                     "url": source.get("url"), "label": source.get("id")}

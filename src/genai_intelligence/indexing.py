@@ -213,8 +213,10 @@ def _fresh(existing: dict | None, fingerprint: str, *, now: datetime, model: str
         return False
     age = now - checked.astimezone(timezone.utc)
     if (existing["source_fingerprint"] == fingerprint and existing["embedding_model"] == model
-            and existing["status"] == "failed" and age < timedelta(days=7)):
-        return True
+            and existing["status"] == "failed"):
+        retry_after = timedelta(hours=20) if "HTTP 429" in str(existing.get("error") or "") else timedelta(days=7)
+        if age < retry_after:
+            return True
     return (existing["status"] == "ready" and existing["source_fingerprint"] == fingerprint
             and existing["embedding_model"] == model and age < timedelta(days=30))
 
@@ -231,6 +233,7 @@ def index_recent_documents(repo: Repository, *, now: datetime | None = None,
       WHERE s.type IN ('rss','arxiv') AND a.source_id NOT IN ('huggingface_models','github_trending_ai')
       ORDER BY COALESCE(a.published_at,a.collected_at) DESC""").fetchall()
     indexed = failed = skipped = attempted = 0
+    rate_limited = False
     for raw in rows:
         if attempted >= max(1, limit):
             break
@@ -281,8 +284,15 @@ def index_recent_documents(repo: Repository, *, now: datetime | None = None,
             except Exception:
                 logger.exception("Unable to persist indexing failure")
             failed += 1
+            response = getattr(exc, "response", None)
+            if response is not None and response.status_code == 429:
+                # Stop this batch on provider quota/rate exhaustion. Continuing
+                # would make every remaining document fail identically.
+                rate_limited = True
+                break
         # Keep each embedding batch below the public API's recommended request rate.
         if attempted < max(1, limit):
             time.sleep(1.0)
-    return {"status": "complete", "indexed": indexed, "failed": failed, "skipped": skipped,
+    return {"status": "rate_limited" if rate_limited else "complete",
+            "indexed": indexed, "failed": failed, "skipped": skipped,
             "attempted": attempted, "embedding_model": model}

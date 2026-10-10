@@ -37,6 +37,18 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
   error TEXT
 );
 CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS article_studies (
+  article_id TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  study_json TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reading_progress (
+  article_id TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  completed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS weekly_editions (
+  week_id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, article_ids_json TEXT NOT NULL,
+  story_count INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'published'
+);
 """
 
 POSTGRES_SCHEMA = """
@@ -62,6 +74,18 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
   fetched_count INTEGER NOT NULL DEFAULT 0, inserted_count INTEGER NOT NULL DEFAULT 0, error TEXT
 );
 CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS article_studies (
+  article_id TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  study_json TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reading_progress (
+  article_id TEXT PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+  completed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS weekly_editions (
+  week_id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, article_ids_json TEXT NOT NULL,
+  story_count INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'published'
+);
 """
 
 
@@ -192,3 +216,38 @@ class Repository:
     def counts(self) -> dict[str, int]:
         return {table: int(self.conn.execute(f"SELECT COUNT(*) AS total FROM {table}").fetchone()["total"])
                 for table in ("sources", "articles", "ingestion_runs")}
+
+    def get_article(self, article_id: str):
+        return self.conn.execute("SELECT * FROM articles WHERE id=?", (article_id,)).fetchone()
+
+    def get_study(self, article_id: str):
+        return self.conn.execute("SELECT * FROM article_studies WHERE article_id=?", (article_id,)).fetchone()
+
+    def save_study(self, article_id: str, study: dict, provider: str, model: str) -> None:
+        from datetime import datetime, timezone
+        self.conn.execute("""INSERT INTO article_studies(article_id,study_json,provider,model,created_at)
+          VALUES(?,?,?,?,?) ON CONFLICT(article_id) DO NOTHING""",
+          (article_id, json.dumps(study, ensure_ascii=False), provider, model, datetime.now(timezone.utc).isoformat()))
+        self.conn.commit()
+
+    def mark_completed(self, article_id: str) -> None:
+        from datetime import datetime, timezone
+        self.conn.execute("""INSERT INTO reading_progress(article_id,completed_at) VALUES(?,?)
+          ON CONFLICT(article_id) DO NOTHING""", (article_id, datetime.now(timezone.utc).isoformat()))
+        self.conn.commit()
+
+    def get_weekly_edition(self, week_id: str):
+        return self.conn.execute("SELECT * FROM weekly_editions WHERE week_id=?", (week_id,)).fetchone()
+
+    def save_weekly_draft(self, week_id: str, article_ids: list[str]) -> None:
+        from datetime import datetime, timezone
+        self.conn.execute("""INSERT INTO weekly_editions(week_id,generated_at,article_ids_json,story_count,status)
+          VALUES(?,?,?,?, 'draft') ON CONFLICT(week_id) DO NOTHING""",
+          (week_id, datetime.now(timezone.utc).isoformat(), json.dumps(article_ids), len(article_ids)))
+        self.conn.commit()
+
+    def publish_weekly_edition(self, week_id: str) -> None:
+        from datetime import datetime, timezone
+        self.conn.execute("UPDATE weekly_editions SET status='published',generated_at=? WHERE week_id=?",
+                          (datetime.now(timezone.utc).isoformat(), week_id))
+        self.conn.commit()

@@ -62,6 +62,16 @@ def _normalized_title(value: str) -> str:
     return " ".join(_WORD_RE.findall(value.casefold()))
 
 
+def _similar_title(first: str, second: str) -> bool:
+    if not first or not second:
+        return False
+    if first == second:
+        return True
+    left, right = set(first.split()), set(second.split())
+    union = left | right
+    return len(union) >= 5 and len(left & right) / len(union) >= 0.82
+
+
 def _score(item: dict, now: datetime) -> tuple[float, list[str], datetime] | None:
     source_timestamps = [dt for dt in (_as_datetime(item.get("published_at")),
                                        _as_datetime(item.get("updated_at"))) if dt]
@@ -121,21 +131,22 @@ def curate_articles(
 
     selected: list[dict] = []
     source_counts: dict[str, int] = {}
-    seen_urls: set[str] = set()
-    seen_titles: list[str] = []
     for score, _published, title, item, reasons in ranked:
         source_id = str(item.get("source_id") or "unknown")
         canonical_url = str(item.get("canonical_url") or item.get("url") or "").casefold().rstrip("/")
+        duplicate = next((existing for existing in selected
+                          if (canonical_url and canonical_url == str(existing.get("canonical_url") or existing.get("url") or "").casefold().rstrip("/"))
+                          or _similar_title(title, _normalized_title(str(existing.get("title") or "")))), None)
+        if duplicate:
+            related = duplicate.setdefault("related_sources", [])
+            if source_id != duplicate.get("source_id") and not any(row.get("url") == item.get("url") for row in related):
+                related.append({"source_id": source_id, "title": item.get("title"), "url": item.get("url"),
+                                "summary": item.get("summary") or item.get("content") or ""})
+                duplicate["categories"] = sorted(set(duplicate.get("categories", [])) | set(item.get("categories", [])))
+            continue
+        if len(selected) >= max(1, limit):
+            continue
         if source_counts.get(source_id, 0) >= per_source:
-            continue
-        if canonical_url and canonical_url in seen_urls:
-            continue
-        if title and any(
-            title == previous
-            or (len(set(title.split()) | set(previous.split())) >= 5
-                and len(set(title.split()) & set(previous.split())) / len(set(title.split()) | set(previous.split())) >= 0.82)
-            for previous in seen_titles
-        ):
             continue
 
         selected_item = dict(item)
@@ -143,11 +154,5 @@ def curate_articles(
         selected_item["selection_reasons"] = reasons
         selected.append(selected_item)
         source_counts[source_id] = source_counts.get(source_id, 0) + 1
-        if canonical_url:
-            seen_urls.add(canonical_url)
-        if title:
-            seen_titles.append(title)
-        if len(selected) >= max(1, limit):
-            break
     return selected
 

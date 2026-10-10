@@ -1,6 +1,6 @@
-# GenAI Intelligence V0.3
+# GenAI Intelligence V0.4
 
-A zero-cost, source-linked GenAI technology newspaper. It collects public RSS/Atom feeds and public GitHub, Hugging Face Hub, and arXiv API results, then selects a compact daily briefing with explainable rules. It does not call an LLM or any paid service.
+A free-first, source-linked GenAI weekly notebook. It collects public RSS/Atom feeds and public GitHub, Hugging Face Hub, and arXiv API results, then selects a compact seven-day briefing with explainable rules. A scheduled publisher prepares one story per day into a saved weekly edition using Groq first and Gemini second. There is no paid-provider fallback; free-tier availability and quotas depend on the provider accounts.
 
 ## What is included
 
@@ -13,6 +13,11 @@ A zero-cost, source-linked GenAI technology newspaper. It collects public RSS/At
 - A full archive remains available from the **All articles** view; items are not deleted by curation.
 - Articles are classified individually into the agreed eight radar topics: foundation models, agentic AI, frameworks/tools, RAG/retrieval, benchmarks/evaluation, AI research, inference/infrastructure, and startups/products. The site exposes these as topic navigation; source-wide labels no longer determine every article's topic.
 - Topic assignment currently uses transparent keyword rules over each article's title, abstract/summary, body, and feed tags. Existing database rows are reclassified once on first startup after this update. Items without a strong keyword match fall into AI research so every document stays discoverable.
+- A rolling seven-day reader labeled **This week**, plus a full library archive.
+- A saved, immutable weekly edition containing up to six selected developments and their generated explanations. A separate daily Vercel cron prepares up to two stories per run, resumes from its saved draft, and publishes the issue when all stories are ready. It skips an already-published issue and retries the next day if a free model is temporarily unavailable.
+- Exact and near-matching headlines from different sources are grouped as one development in the edition; the generated note can use corroborating coverage and retains those source links as evidence.
+- Private read-to-study workflow: marking an item complete saves reading progress and generates a grounded learning note, a short multiple-choice quiz, and flashcards. Study material is cached per article so it is generated once and reused.
+- Groq-first, Gemini-second provider fallback. Failed requests and free-quota exhaustion fall through to the next configured provider; when both fail, no paid service is attempted and the item can be retried later.
 - A CLI for listing sources, ingesting, browsing recent articles, and checking database counts, plus a searchable web reader and JSON API.
 - A Dockerfile and Docker Compose configuration for hosting with persistent storage and daily scheduled collection.
 - Tests for source loading, URL normalization, idempotency, and collection failures.
@@ -33,7 +38,9 @@ genai-intel stats
 uvicorn genai_intelligence.web:app --reload
 ```
 
-The reader is available at `http://127.0.0.1:8000`; its default page is the daily briefing, while **All articles** opens the full archive. The JSON API defaults to the briefing at `/api/articles`; use `/api/articles?edition=all` for the archive. `/health` is the health check. The web service starts collection on startup and repeats every 24 hours. Set `ENABLE_INGESTION=false` to serve only already-collected data, or change `INGEST_INTERVAL_HOURS`. The command defaults to `config/sources.yaml` and `data/genai_intelligence.sqlite3`. Override these with `--config`, `--db`, `GENAI_INTEL_CONFIG`, or `GENAI_INTEL_DB`. A `GITHUB_TOKEN` or `HF_TOKEN` environment variable is optional and only raises public API rate limits. No `.env` loader is required; export values in your shell or use your preferred dotenv tool.
+The reader is available at `http://127.0.0.1:8000`; its default page shows the rolling seven-day edition, while **All articles** opens the full archive. The JSON API defaults to the briefing at `/api/articles`; use `/api/articles?edition=all` for the archive. `/health` is the health check. The web service starts collection on startup and repeats every 24 hours. Set `ENABLE_INGESTION=false` to serve only already-collected data, or change `INGEST_INTERVAL_HOURS`. The command defaults to `config/sources.yaml` and `data/genai_intelligence.sqlite3`. Override these with `--config`, `--db`, `GENAI_INTEL_CONFIG`, or `GENAI_INTEL_DB`. A `GITHUB_TOKEN` or `HF_TOKEN` environment variable is optional and only raises public API rate limits. No `.env` loader is required; export values in your shell or use your preferred dotenv tool.
+
+For private study-kit and reading-progress endpoints, set `NOTEBOOK_ACCESS_TOKEN` to a long random secret. The browser asks for this token on the first use and stores it in local browser storage. Add `GROQ_API_KEY` and/or `GEMINI_API_KEY`; the app tries Groq first, then Gemini. For a strict $0 setup, keep both provider accounts on their free tiers and do not attach billing that would allow paid usage. Provider quota exhaustion never triggers a paid provider or paid model fallback.
 
 ## Run as a hosted web service
 
@@ -51,9 +58,9 @@ To publish externally, deploy this Dockerfile to a container host that supports 
 
 1. Put this repository on GitHub, GitLab, or Bitbucket and import it into Vercel. You can make the app source public/open-source; Vercel itself is a hosted service, not open-source software. You do not need to install Vercel tooling on your computer for Git based deployment.
 2. Create a Neon Postgres database using the free plan and copy its pooled connection string into the Vercel project's `DATABASE_URL` environment variable.
-3. Add a random secret as `CRON_SECRET` in Vercel project environment variables. Do not commit the real value to the repository. Leave `ENABLE_INGESTION` unset or set it to `false`; Vercel Cron handles collection.
-4. Deploy the project. The included Vercel configuration runs collection daily and allows the function up to five minutes. Vercel's Hobby cron supports once-daily schedules, which suits this newspaper.
-5. Visit the deployment URL and `/api/articles`; the first collection runs at the next scheduled time. Run the cron route manually from Vercel's Cron Jobs page after deployment to populate the first issue immediately.
+3. Add a random secret as `CRON_SECRET` in Vercel project environment variables. Add `NOTEBOOK_ACCESS_TOKEN`, `GROQ_API_KEY`, and `GEMINI_API_KEY` there too. Do not commit any real secrets to the repository. Leave `ENABLE_INGESTION` unset or set it to `false`; Vercel Cron handles collection.
+4. Deploy the project. The Vercel config collects sources at 02:00 UTC and advances weekly-edition creation at 04:00 UTC. Each cron runs daily; the publisher generates up to two stories per run to stay within serverless time limits and retries if a provider is unavailable.
+5. Visit the deployment URL and `/issues`; a saved edition appears after up to three successful generation runs. The current home page remains available while the issue is being prepared.
 
 In Vercel, `DATABASE_URL` switches the repository layer from local SQLite to Postgres so articles persist across serverless invocations. Vercel's free Hobby plan is for personal, non-commercial projects; plan limits and Neon free allowances can change, so check their current terms before public growth. [Vercel Python/FastAPI support](https://vercel.com/docs/functions/runtimes/python), [Vercel Hobby plan](https://vercel.com/docs/plans/hobby), [Vercel Cron limits](https://vercel.com/docs/cron-jobs/manage-cron-jobs), [Neon integration](https://vercel.com/marketplace/neon).
 
@@ -68,4 +75,4 @@ Collection errors are isolated per source, recorded in `ingestion_runs`, reporte
 
 ## Topic classification and curation
 
-The database keeps the complete normalized archive. The daily briefing considers items from the last seven days, favors freshness and higher configured source trust, boosts selected high-signal headline terms, uses engagement metadata when available, removes exact and near-duplicate headlines, and caps each source at three stories. Selection rules and topic tags are deterministic and explainable. Topic tagging is article-level and can assign multiple radar topics. It does not yet merge articles into one event or generate a self-contained newspaper story; those are the next intelligence features. `trust_score` is a source default, not a claim that an article has been editorially reviewed.
+The database keeps the complete normalized archive. The seven-day view favors freshness and higher configured source trust, boosts selected high-signal headline terms, uses engagement metadata when available, removes exact and near-duplicate headlines, and caps each source at three stories. Selection rules and topic tags are deterministic and explainable. Topic tagging is article-level and can assign multiple radar topics. Generated study kits are grounded in each source item's available text and clearly retain the source link; cross-source event clustering and a synthesized edition-wide editorial are not included yet. `trust_score` is a source default, not a claim that an article has been editorially reviewed.

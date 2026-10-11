@@ -48,7 +48,8 @@ def _phase(repo: Repository, name: str, operation) -> dict:
         if name == "index" and result.get("failed", 0):
             result["document_failures"] = [dict(row) for row in repo.conn.execute("""SELECT a.title,
               a.source_id,d.error FROM article_documents d JOIN articles a ON a.id=d.article_id
-              WHERE d.status='failed' ORDER BY d.indexed_at DESC LIMIT 8""").fetchall()]
+              WHERE d.status='failed' AND d.indexed_at>=?
+              ORDER BY d.indexed_at DESC LIMIT 8""", (started,)).fetchall()]
         repo.finish_pipeline_run(run_id, _now(), status, {"result": result})
         record = {"phase": name, "status": status, "result": result}
         _report(record)

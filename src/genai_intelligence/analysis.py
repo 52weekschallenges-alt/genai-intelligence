@@ -127,7 +127,7 @@ def _groq(prompt: str) -> tuple[dict, str]:
                              endpoint="api.groq.com/openai/v1/chat/completions") as trace:
         response = httpx.post("https://api.groq.com/openai/v1/chat/completions", timeout=TIMEOUT,
             headers={"Authorization": f"Bearer {key}"},
-            json={"model": model, "temperature": 0.2, "max_completion_tokens": 2600,
+            json={"model": model, "temperature": 0.2, "max_completion_tokens": 3800,
                   "response_format": {"type": "json_schema", "json_schema": {
                       "name": "notebook_analysis", "strict": True,
                       "schema": ANALYSIS_RESPONSE_SCHEMA}},

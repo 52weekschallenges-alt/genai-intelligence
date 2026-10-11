@@ -12,8 +12,24 @@ from .telemetry import track_external_call
 
 logger = logging.getLogger("genai_intelligence.analysis")
 ANALYSIS_VERSION = 1
-TIMEOUT = httpx.Timeout(100.0, connect=10.0)
+TIMEOUT = httpx.Timeout(240.0, connect=10.0)
 MIN_ANALYSIS_WORDS = 500
+ANALYSIS_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "executive_takeaway": {"type": "string"},
+        "sections": {"type": "array", "items": {"type": "object", "properties": {
+            "heading": {"type": "string"},
+            "paragraphs": {"type": "array", "items": {"type": "string"}},
+        }, "required": ["heading", "paragraphs"], "additionalProperties": False}},
+        "key_points": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "scope_note": {"type": "string"},
+        "source_refs": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["executive_takeaway", "sections", "key_points", "confidence", "scope_note", "source_refs"],
+    "additionalProperties": False,
+}
 
 
 def _prompt(article: dict, related: list[dict], *, compact: bool = False) -> str:
@@ -112,10 +128,12 @@ def _groq(prompt: str) -> tuple[dict, str]:
         response = httpx.post("https://api.groq.com/openai/v1/chat/completions", timeout=TIMEOUT,
             headers={"Authorization": f"Bearer {key}"},
             json={"model": model, "temperature": 0.2, "max_completion_tokens": 2600,
-                  "response_format": {"type": "json_object"},
-                  # GPT-OSS requires hidden or parsed reasoning when JSON mode
-                  # is enabled; raw reasoning can make the response invalid.
-                  "reasoning_format": "hidden",
+                  "response_format": {"type": "json_schema", "json_schema": {
+                      "name": "notebook_analysis", "strict": True,
+                      "schema": ANALYSIS_RESPONSE_SCHEMA}},
+                  # GPT-OSS uses include_reasoning; reasoning_format is not
+                  # supported by this model and can cause request failures.
+                  "include_reasoning": False,
                   "messages": [{"role": "user", "content": prompt}]})
         trace["http_status"] = response.status_code
         response.raise_for_status()
@@ -134,19 +152,8 @@ def _gemini(prompt: str) -> tuple[dict, str]:
             timeout=TIMEOUT, headers={"x-goog-api-key": key},
             json={"contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {"temperature": 0.2, "maxOutputTokens": 3800,
-                    "responseFormat": {"text": {"mimeType": "APPLICATION_JSON", "schema": {
-                      "type": "object",
-                      "properties": {
-                        "executive_takeaway": {"type": "string"},
-                        "sections": {"type": "array", "items": {"type": "object", "properties": {
-                          "heading": {"type": "string"},
-                          "paragraphs": {"type": "array", "items": {"type": "string"}}},
-                          "required": ["heading", "paragraphs"]}},
-                        "key_points": {"type": "array", "items": {"type": "string"}},
-                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-                        "scope_note": {"type": "string"},
-                        "source_refs": {"type": "array", "items": {"type": "string"}}},
-                      "required": ["executive_takeaway", "sections", "key_points", "confidence", "scope_note", "source_refs"]}}}}})
+                    "responseFormat": {"text": {"mimeType": "APPLICATION_JSON",
+                                                   "schema": ANALYSIS_RESPONSE_SCHEMA}}}})
         trace["http_status"] = response.status_code
         response.raise_for_status()
         payload = response.json()
